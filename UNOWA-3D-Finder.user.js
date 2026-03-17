@@ -1,14 +1,14 @@
 // ==UserScript==
-// @name         UNOWA Finder Stable Fast Scan (clean draggable)
+// @name         UNOWA Finder + Export Logger
 // @namespace    https://unowa.eu/
-// @version      2.2.3
-// @description  Fast search across UNOWA 3D models with auto language, 100/page, clickable results, row highlight and draggable UI
+// @version      2.7.0
+// @description  Search UNOWA models and export embed iframe catalog with live log panel
 // @author       ChatGPT
 // @match        https://*.unowa.eu/*
 // @run-at       document-idle
 // @grant        none
-// @homepageURL  https://github.com/Lex-Dorosh/UNOWA
-// @supportURL   https://github.com/Lex-Dorosh/UNOWA/issues
+// @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO
+// @supportURL   https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO/issues
 // @updateURL    https://raw.githubusercontent.com/Lex-Dorosh/UNOWA/main/UNOWA-3D-Finder.user.js
 // @downloadURL  https://raw.githubusercontent.com/Lex-Dorosh/UNOWA/main/UNOWA-3D-Finder.user.js
 // ==/UserScript==
@@ -16,95 +16,67 @@
 (function () {
   'use strict';
 
-  if (window.__UNOWA_FINDER_V223__) return;
-  window.__UNOWA_FINDER_V223__ = true;
+  if (window.__UNOWA_FINDER_V270__) return;
+  window.__UNOWA_FINDER_V270__ = true;
 
   const CFG = {
     ui: {
-      width: 460,
+      width: 590,
       zIndex: 2147483000
     },
     timings: {
-      pollMs: 120,
+      pollMs: 90,
       stableForMs: 220,
-      pageStableTimeoutMs: 2600,
-      shortTimeoutMs: 1800,
-      afterClickMs: 90,
-      afterPageClickMs: 140,
-      afterTypeSwitchMs: 180,
-      afterSelectMs: 140,
-      flashMs: 4200
+      shortTimeoutMs: 1600,
+      clickSettleMs: 120,
+      typeSwitchMs: 220,
+      menuOpenMs: 260,
+      menuActionMs: 420,
+      flashMs: 4200,
+      searchPageReadyMs: 2600,
+      exportPageReadyMs: 5200,
+      exportRetryDelayMs: 420,
+      pageChangeTimeoutMs: 2600
     },
-    scan: {
-      preferredPerPage: 100,
-      emptyPageRetries: 2,
-      pageRetrySleepMs: 380
+    retries: {
+      langSwitch: 3,
+      pageReady: 3,
+      embedFast: 2,
+      embedRecovery: 3,
+      refindRow: 3
     },
     storage: {
       minimized: 'unowaFinder.minimized',
       hidden: 'unowaFinder.hidden',
+      position: 'unowaFinder.position',
       query: 'unowaFinder.query',
-      languageMode: 'unowaFinder.languageMode',
-      position: 'unowaFinder.position'
+      lang: 'unowaFinder.lang',
+      exportAllLangs: 'unowaFinder.exportAllLangs'
     }
   };
 
   const state = {
     running: false,
     stopRequested: false,
-    booted: false,
+    results: [],
+    failures: [],
+    logs: [],
+    panelMode: 'results',
+    lastHighlightedRow: null,
     hidden: localStorage.getItem(CFG.storage.hidden) === '1',
     minimized: localStorage.getItem(CFG.storage.minimized) === '1',
-    results: [],
-    searchMeta: null,
-    ui: {},
-    lastHighlightedRow: null,
-    drag: {
-      active: false,
-      offsetX: 0,
-      offsetY: 0
-    }
+    drag: { active: false, dx: 0, dy: 0 },
+    ui: {}
   };
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const q = (sel, root = document) => root.querySelector(sel);
   const qa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-
-  function normalizeText(s) {
-    return String(s || '').replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim();
-  }
-
-  function escapeRegExp(s) {
-    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  function hasCyrillic(s) {
-    return /[\u0400-\u04FF\u0500-\u052F]/.test(s || '');
-  }
-
-  function hasLatin(s) {
-    return /[A-Za-z]/.test(s || '');
-  }
-
-  function detectQueryLanguage(query) {
-    if (hasCyrillic(query)) return 'ru';
-    if (hasLatin(query)) return 'en';
-    return null;
-  }
-
-  function buildMatcher(query, opts) {
-    const textQuery = String(query || '');
-    if (!textQuery.trim()) throw new Error('Пустой запрос');
-    const flags = opts.caseSensitive ? 'g' : 'gi';
-    const re = opts.useRegex ? new RegExp(textQuery, flags) : new RegExp(escapeRegExp(textQuery), flags);
-    return {
-      re,
-      test(text) {
-        re.lastIndex = 0;
-        return re.test(text || '');
-      }
-    };
-  }
+  const norm = (s) => String(s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+  const lower = (s) => norm(s).toLowerCase();
+  const isCyr = (s) => /[А-Яа-яЁёІіЇїЄєҐґ]/.test(String(s || ''));
+  const escHtml = (s) => String(s || '').replace(/[&<>"']/g, m => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[m]));
+  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
   function clickEl(el) {
     if (!el) return false;
@@ -114,15 +86,15 @@
       el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
       el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    } catch {
-      try { el.click(); } catch { return false; }
-    }
-    return true;
+      return true;
+    } catch {}
+    try { el.click(); return true; } catch {}
+    return false;
   }
 
   async function waitUntil(fn, timeoutMs = 2000, pollMs = 100) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
       try {
         const v = fn();
         if (v) return v;
@@ -132,11 +104,18 @@
     return null;
   }
 
-  function clamp(n, min, max) {
-    return Math.max(min, Math.min(max, n));
+  function isVisible(el) {
+    if (!el) return false;
+    const cs = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
   }
 
-  function readSavedPosition() {
+  function savePos(x, y) {
+    try { localStorage.setItem(CFG.storage.position, JSON.stringify({ x, y })); } catch {}
+  }
+
+  function loadPos() {
     try {
       const raw = localStorage.getItem(CFG.storage.position);
       if (!raw) return null;
@@ -148,61 +127,90 @@
     }
   }
 
-  function savePosition(x, y) {
-    try {
-      localStorage.setItem(CFG.storage.position, JSON.stringify({ x, y }));
-    } catch {}
-  }
-
-  function applyPosition(x, y) {
+  function applyPos(x, y) {
     const root = state.ui.root;
     if (!root) return;
-    const vw = window.innerWidth || document.documentElement.clientWidth || 1200;
-    const vh = window.innerHeight || document.documentElement.clientHeight || 800;
-    const panelW = CFG.ui.width;
-    const panelH = Math.max(80, root.offsetHeight || 80);
-    const nx = clamp(Math.round(x), 0, Math.max(0, vw - panelW));
-    const ny = clamp(Math.round(y), 0, Math.max(0, vh - Math.min(panelH, vh)));
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1400;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 900;
+    const w = CFG.ui.width;
+    const h = Math.max(60, root.offsetHeight || 60);
+    const nx = clamp(Math.round(x), 0, Math.max(0, vw - w));
+    const ny = clamp(Math.round(y), 0, Math.max(0, vh - Math.min(h, vh)));
     root.style.left = `${nx}px`;
     root.style.top = `${ny}px`;
     root.style.right = 'auto';
     root.style.bottom = 'auto';
-    savePosition(nx, ny);
+    savePos(nx, ny);
+  }
+
+  function setStatus(text) {
+    if (state.ui.status) state.ui.status.textContent = text;
+  }
+
+  function appendLog(text, kind = 'info') {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+
+    state.logs.push({
+      ts: `${hh}:${mm}:${ss}`,
+      text: String(text || ''),
+      kind
+    });
+
+    if (state.logs.length > 1800) state.logs = state.logs.slice(-1400);
+    if (state.panelMode === 'logs') renderLogs();
+  }
+
+  function setPanelMode(mode) {
+    state.panelMode = mode === 'logs' ? 'logs' : 'results';
+    if (state.ui.resultsTab) state.ui.resultsTab.classList.toggle('active', state.panelMode === 'results');
+    if (state.ui.logsTab) state.ui.logsTab.classList.toggle('active', state.panelMode === 'logs');
+    renderPanel();
+  }
+
+  function renderPanel() {
+    if (state.panelMode === 'logs') renderLogs();
+    else renderResults();
   }
 
   function injectStyles() {
-    if (q('#unowa-finder-styles')) return;
+    if (q('#unowaFinderStyles')) return;
     const st = document.createElement('style');
-    st.id = 'unowa-finder-styles';
+    st.id = 'unowaFinderStyles';
     st.textContent = `
 #unowaFinderRoot{position:fixed;top:12px;right:12px;width:${CFG.ui.width}px;z-index:${CFG.ui.zIndex};font:12px/1.35 Arial,sans-serif;color:#eaeaea}
+#unowaFinderRoot.hidden{display:none}
 #unowaFinderPanel{background:#1f2329;border:1px solid #3a404a;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.35);overflow:hidden}
 #unowaFinderHeader{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#2a3038;border-bottom:1px solid #3a404a;gap:8px;cursor:move;user-select:none}
-#unowaFinderTitle{font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:6px}
+#unowaFinderTitle{font-weight:700;letter-spacing:.2px}
 #unowaFinderHeaderBtns{display:flex;gap:6px}
-.unowa-btn-icon{border:1px solid #515966;background:#39424d;color:#fff;border-radius:8px;padding:2px 8px;cursor:pointer;font-size:12px}
-.unowa-btn-icon:hover{background:#485465}
-#unowaFinderBody{padding:10px;display:flex;flex-direction:column;gap:8px;max-height:78vh}
+.uf-iconbtn{border:1px solid #515966;background:#39424d;color:#fff;border-radius:8px;padding:2px 8px;cursor:pointer;font-size:12px}
+.uf-iconbtn:hover{background:#485465}
+#unowaFinderBody{padding:10px;display:flex;flex-direction:column;gap:8px;max-height:82vh}
 #unowaFinderBody.min{display:none}
 #unowaFinderLauncher{position:fixed;top:12px;right:12px;z-index:${CFG.ui.zIndex};display:none;background:#1f2329;color:#fff;border:1px solid #3a404a;border-radius:999px;padding:8px 12px;box-shadow:0 8px 28px rgba(0,0,0,.35);cursor:pointer;font:12px Arial,sans-serif}
 #unowaFinderLauncher.show{display:block}
-#unowaFinderRoot.hidden{display:none}
-#unowaFinderQuery{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5462;background:#111418;color:#fff;outline:none}
-#unowaFinderQuery:focus{border-color:#7ea6ff;box-shadow:0 0 0 2px rgba(126,166,255,.22)}
-.unowa-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.unowa-row.nowrap{flex-wrap:nowrap}
-.unowa-label{opacity:.9}
-.unowa-select{padding:5px 6px;border-radius:8px;border:1px solid #4b5462;background:#111418;color:#fff}
-.unowa-check{display:inline-flex;gap:4px;align-items:center}
-.unowa-mainbtn{border:1px solid #4e6db3;background:#3359c8;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;font-weight:600}
-.unowa-mainbtn:hover{background:#3f66d7}
-.unowa-mainbtn.secondary{border-color:#515966;background:#39424d}
-.unowa-mainbtn.secondary:hover{background:#485465}
-.unowa-mainbtn.stop{border-color:#8f3f4a;background:#7c2f3a}
-.unowa-mainbtn.stop:hover{background:#8c3845}
-.unowa-mainbtn:disabled{opacity:.55;cursor:not-allowed}
-#unowaFinderStatus{padding:6px 8px;border:1px solid #3a404a;border-radius:8px;background:#151a1f;color:#d5d9e0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#unowaFinderResults{border:1px solid #3a404a;border-radius:10px;background:#111418;overflow:auto;min-height:120px;max-height:46vh;padding:6px}
+#ufQuery{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5462;background:#111418;color:#fff;outline:none}
+#ufQuery:focus{border-color:#7ea6ff;box-shadow:0 0 0 2px rgba(126,166,255,.22)}
+.uf-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.uf-check{display:inline-flex;gap:4px;align-items:center}
+.uf-select{padding:5px 6px;border-radius:8px;border:1px solid #4b5462;background:#111418;color:#fff}
+.uf-btn{border:1px solid #4e6db3;background:#3359c8;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;font-weight:600}
+.uf-btn:hover{background:#3f66d7}
+.uf-btn.secondary{border-color:#515966;background:#39424d}
+.uf-btn.secondary:hover{background:#485465}
+.uf-btn.stop{border-color:#8f3f4a;background:#7c2f3a}
+.uf-btn.stop:hover{background:#8c3845}
+.uf-btn.export{border-color:#5a8a50;background:#2f7c3a}
+.uf-btn.export:hover{background:#399346}
+.uf-btn:disabled{opacity:.55;cursor:not-allowed}
+#ufStatus{padding:6px 8px;border:1px solid #3a404a;border-radius:8px;background:#151a1f;color:#d5d9e0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#ufPanelTabs{display:flex;gap:6px}
+.uf-tab{border:1px solid #4e5662;background:#222831;color:#d9dfeb;border-radius:8px;padding:4px 8px;cursor:pointer}
+.uf-tab.active{background:#3658b8;border-color:#5e83ef;color:#fff}
+#ufPanelHost{border:1px solid #3a404a;border-radius:10px;background:#111418;overflow:auto;min-height:140px;max-height:50vh;padding:6px}
 .uf-empty{opacity:.75;padding:8px}
 .uf-item{border:1px solid #313844;border-radius:10px;background:#171c22;padding:8px;margin-bottom:6px}
 .uf-item:last-child{margin-bottom:0}
@@ -210,25 +218,129 @@
 .uf-badges{display:flex;gap:6px;flex-wrap:wrap}
 .uf-badge{padding:2px 6px;border-radius:999px;border:1px solid #4d5766;background:#232a33;color:#d8deea;font-size:11px}
 .uf-model{font-weight:700;color:#fff;margin:6px 0 4px;word-break:break-word}
-.uf-desc{color:#cdd3dd;opacity:.92;word-break:break-word;max-height:46px;overflow:hidden}
+.uf-desc{color:#cdd3dd;opacity:.92;word-break:break-word;max-height:48px;overflow:hidden}
 .uf-actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 .uf-linkbtn{border:1px solid #4f5f75;background:#243243;color:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;font-size:12px}
 .uf-linkbtn:hover{background:#2e4056}
 .uf-linkbtn.alt{background:#2d2734;border-color:#675683}
 .uf-linkbtn.alt:hover{background:#3a3145}
 .uf-small{opacity:.8;font-size:11px}
-.uf-count{font-weight:700;color:#fff}
-.uf-highlight-row{outline:2px solid #ffce4b !important;outline-offset:-2px;background:rgba(255,206,75,.12) !important;transition:background .2s ease}
+.uf-log{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border-bottom:1px solid #232931;padding:4px 2px;white-space:pre-wrap;word-break:break-word}
+.uf-log:last-child{border-bottom:none}
+.uf-log .t{opacity:.7;margin-right:8px}
+.uf-log.info{color:#d7dcef}
+.uf-log.ok{color:#9de3a6}
+.uf-log.warn{color:#ffd27a}
+.uf-log.err{color:#ff9088}
+.uf-highlight-row{outline:3px solid #ff3b30 !important;outline-offset:-2px;background:rgba(255,59,48,.16) !important;box-shadow:inset 0 0 0 1px rgba(255,59,48,.35) !important;transition:background .2s ease}
 `;
     document.head.appendChild(st);
   }
 
-  function escapeHtml(s) {
-    return String(s || '').replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+  function updateButtons() {
+    if (!state.ui.startBtn) return;
+    state.ui.startBtn.disabled = state.running;
+    state.ui.exportBtn.disabled = state.running;
+    state.ui.stopBtn.disabled = !state.running;
+  }
+
+  function selectedTypesFromUI() {
+    const out = [];
+    if (state.ui.scanStructure?.checked) out.push('structure');
+    if (state.ui.scanAnimation?.checked) out.push('animation');
+    return out;
+  }
+
+  function createResultKey(lang, type, model, desc) {
+    return `${lang || ''}||${type || ''}||${lower(model)}||${lower(desc)}`;
+  }
+
+  function addResult(item) {
+    const key = createResultKey(item.lang, item.type, item.model, item.description);
+    if (state.results.some(x => x.uniqueKey === key)) return false;
+    item.uniqueKey = key;
+    state.results.push(item);
+    return true;
+  }
+
+  function renderResults() {
+    const box = state.ui.panelHost;
+    if (!box) return;
+    state.ui.count.textContent = String(state.results.length);
+
+    if (!state.results.length) {
+      box.innerHTML = `<div class="uf-empty">Результаты появятся здесь</div>`;
+      return;
+    }
+
+    box.innerHTML = '';
+    state.results.forEach((r, idx) => {
+      const div = document.createElement('div');
+      div.className = 'uf-item';
+      div.innerHTML = `
+        <div class="uf-top">
+          <div class="uf-badges">
+            <span class="uf-badge">${idx + 1}</span>
+            <span class="uf-badge">${escHtml(r.lang || '')}</span>
+            <span class="uf-badge">${escHtml(r.type)}</span>
+            <span class="uf-badge">page ${r.page}</span>
+          </div>
+          <div class="uf-small">row ${r.rowIndex}</div>
+        </div>
+        <div class="uf-model">${escHtml(r.model)}</div>
+        <div class="uf-desc">${escHtml(r.description)}</div>
+        <div class="uf-actions">
+          <button class="uf-linkbtn" data-act="open">Перейти к строке</button>
+          <button class="uf-linkbtn alt" data-act="actions">Открыть Actions</button>
+        </div>
+      `;
+
+      div.addEventListener('click', async (e) => {
+        const btn = e.target.closest('button[data-act]');
+        if (!btn) return;
+        const act = btn.getAttribute('data-act');
+        btn.disabled = true;
+        try {
+          if (act === 'open') {
+            btn.textContent = 'Переход...';
+            await navigateToResult(r, false);
+          } else {
+            btn.textContent = 'Открываю...';
+            await navigateToResult(r, true);
+          }
+        } catch (err) {
+          setStatus(`Ошибка перехода: ${err?.message || err}`);
+          appendLog(`Переход к результату не удался: ${err?.message || err}`, 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = act === 'open' ? 'Перейти к строке' : 'Открыть Actions';
+        }
+      });
+
+      box.appendChild(div);
+    });
+  }
+
+  function renderLogs() {
+    const box = state.ui.panelHost;
+    if (!box) return;
+
+    if (!state.logs.length) {
+      box.innerHTML = `<div class="uf-empty">Логи появятся здесь</div>`;
+      return;
+    }
+
+    const stickBottom = Math.abs((box.scrollTop + box.clientHeight) - box.scrollHeight) < 24;
+    box.innerHTML = state.logs.map(l => `
+      <div class="uf-log ${escHtml(l.kind)}"><span class="t">${escHtml(l.ts)}</span>${escHtml(l.text)}</div>
+    `).join('');
+
+    if (stickBottom || state.running) box.scrollTop = box.scrollHeight;
   }
 
   function createUI() {
     if (q('#unowaFinderRoot')) return;
+
     injectStyles();
 
     const root = document.createElement('div');
@@ -243,42 +355,49 @@
     header.innerHTML = `
       <div id="unowaFinderTitle">🔎 UNOWA Finder</div>
       <div id="unowaFinderHeaderBtns">
-        <button class="unowa-btn-icon" id="unowaFinderMinBtn" title="Свернуть/развернуть">${state.minimized ? '▢' : '—'}</button>
-        <button class="unowa-btn-icon" id="unowaFinderCloseBtn" title="Скрыть">✕</button>
-      </div>`;
+        <button class="uf-iconbtn" id="ufMinBtn">${state.minimized ? '▢' : '—'}</button>
+        <button class="uf-iconbtn" id="ufCloseBtn">✕</button>
+      </div>
+    `;
 
     const body = document.createElement('div');
     body.id = 'unowaFinderBody';
     if (state.minimized) body.classList.add('min');
 
-    const lastQuery = localStorage.getItem(CFG.storage.query) || '';
-    const lastLangMode = localStorage.getItem(CFG.storage.languageMode) || 'auto';
+    const savedQuery = localStorage.getItem(CFG.storage.query) || '';
+    const savedLang = localStorage.getItem(CFG.storage.lang) || 'keep';
+    const savedExportAll = localStorage.getItem(CFG.storage.exportAllLangs) === '1';
 
     body.innerHTML = `
-      <input id="unowaFinderQuery" placeholder="Запрос (например: глаз / eye / regex)" value="${escapeHtml(lastQuery)}" />
-      <div class="unowa-row">
-        <label class="unowa-check"><input type="checkbox" id="ufScanStructure" checked> Structure</label>
-        <label class="unowa-check"><input type="checkbox" id="ufScanAnimation" checked> Animation</label>
-        <label class="unowa-check"><input type="checkbox" id="ufCaseSensitive"> Case</label>
-        <label class="unowa-check"><input type="checkbox" id="ufUseRegex"> Regex</label>
+      <input id="ufQuery" placeholder="Запрос (например: глаз / eye)" value="${escHtml(savedQuery)}">
+      <div class="uf-row">
+        <label class="uf-check"><input type="checkbox" id="ufScanStructure" checked> Structure</label>
+        <label class="uf-check"><input type="checkbox" id="ufScanAnimation" checked> Animation</label>
       </div>
-      <div class="unowa-row nowrap">
-        <span class="unowa-label">Язык:</span>
-        <select id="ufLanguageMode" class="unowa-select">
-          <option value="auto">auto (кириллица→ru, латиница→en)</option>
-          <option value="ru">ru</option>
-          <option value="en">en</option>
-          <option value="keep">keep (не менять)</option>
+      <div class="uf-row">
+        <span>Язык:</span>
+        <select id="ufLanguage" class="uf-select">
+          <option value="keep">Текущий</option>
+          <option value="en">English</option>
+          <option value="ru">Русский</option>
         </select>
+        <label class="uf-check"><input type="checkbox" id="ufExportAllLangs"> Export all languages</label>
       </div>
-      <div class="unowa-row">
-        <button id="ufStartBtn" class="unowa-mainbtn">Start</button>
-        <button id="ufStopBtn" class="unowa-mainbtn stop" disabled>Stop</button>
-        <button id="ufClearBtn" class="unowa-mainbtn secondary">Clear</button>
-        <span class="uf-small">Найдено: <span id="ufCount" class="uf-count">0</span></span>
+      <div class="uf-row">
+        <button id="ufStartBtn" class="uf-btn">Start</button>
+        <button id="ufStopBtn" class="uf-btn stop" disabled>Stop</button>
+        <button id="ufClearBtn" class="uf-btn secondary">Clear</button>
+        <button id="ufExportBtn" class="uf-btn export">Export catalog CSV</button>
+        <span class="uf-small">Найдено: <b id="ufCount">0</b></span>
       </div>
-      <div id="unowaFinderStatus">Готов. Введите запрос и нажмите Start</div>
-      <div id="unowaFinderResults"><div class="uf-empty">Результаты появятся здесь</div></div>
+      <div id="ufStatus">Готов. Введите запрос и нажмите Start</div>
+      <div class="uf-row" style="justify-content:space-between">
+        <div id="ufPanelTabs">
+          <button class="uf-tab active" id="ufResultsTab">Results</button>
+          <button class="uf-tab" id="ufLogsTab">Logs</button>
+        </div>
+      </div>
+      <div id="ufPanelHost"><div class="uf-empty">Результаты появятся здесь</div></div>
     `;
 
     panel.appendChild(header);
@@ -293,80 +412,79 @@
     document.body.appendChild(launcher);
 
     state.ui = {
-      root, panel, header, body, launcher,
-      query: q('#unowaFinderQuery', root),
+      root,
+      panel,
+      header,
+      body,
+      launcher,
+      query: q('#ufQuery', root),
       scanStructure: q('#ufScanStructure', root),
       scanAnimation: q('#ufScanAnimation', root),
-      caseSensitive: q('#ufCaseSensitive', root),
-      useRegex: q('#ufUseRegex', root),
-      languageMode: q('#ufLanguageMode', root),
+      language: q('#ufLanguage', root),
+      exportAllLangs: q('#ufExportAllLangs', root),
       startBtn: q('#ufStartBtn', root),
       stopBtn: q('#ufStopBtn', root),
       clearBtn: q('#ufClearBtn', root),
-      status: q('#unowaFinderStatus', root),
-      results: q('#unowaFinderResults', root),
+      exportBtn: q('#ufExportBtn', root),
+      status: q('#ufStatus', root),
+      panelHost: q('#ufPanelHost', root),
       count: q('#ufCount', root),
-      minBtn: q('#unowaFinderMinBtn', root),
-      closeBtn: q('#unowaFinderCloseBtn', root)
+      minBtn: q('#ufMinBtn', root),
+      closeBtn: q('#ufCloseBtn', root),
+      resultsTab: q('#ufResultsTab', root),
+      logsTab: q('#ufLogsTab', root)
     };
 
-    state.ui.languageMode.value = ['auto', 'ru', 'en', 'keep'].includes(lastLangMode) ? lastLangMode : 'auto';
+    state.ui.language.value = ['keep', 'en', 'ru'].includes(savedLang) ? savedLang : 'keep';
+    state.ui.exportAllLangs.checked = !!savedExportAll;
 
-    const savedPos = readSavedPosition();
-    if (savedPos) {
-      requestAnimationFrame(() => applyPosition(savedPos.x, savedPos.y));
-    }
-
-    bindUIEvents();
+    bindUI();
     bindDrag();
+
+    const pos = loadPos();
+    if (pos) requestAnimationFrame(() => applyPos(pos.x, pos.y));
+
     updateButtons();
+    renderPanel();
   }
 
   function bindDrag() {
     const { header, root } = state.ui;
     if (!header || !root) return;
 
-    function isInteractiveTarget(el) {
+    function isInteractive(el) {
       return !!(el.closest('button') || el.closest('input') || el.closest('select') || el.closest('textarea') || el.closest('a') || el.closest('label'));
     }
 
-    function onPointerDown(e) {
+    header.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      if (isInteractiveTarget(e.target)) return;
-      const rect = root.getBoundingClientRect();
+      if (isInteractive(e.target)) return;
+      const r = root.getBoundingClientRect();
       state.drag.active = true;
-      state.drag.offsetX = e.clientX - rect.left;
-      state.drag.offsetY = e.clientY - rect.top;
+      state.drag.dx = e.clientX - r.left;
+      state.drag.dy = e.clientY - r.top;
+      root.style.left = `${r.left}px`;
+      root.style.top = `${r.top}px`;
       root.style.right = 'auto';
-      root.style.left = `${rect.left}px`;
-      root.style.top = `${rect.top}px`;
       try { header.setPointerCapture(e.pointerId); } catch {}
       e.preventDefault();
-    }
+    });
 
-    function onPointerMove(e) {
+    window.addEventListener('pointermove', (e) => {
       if (!state.drag.active) return;
-      const x = e.clientX - state.drag.offsetX;
-      const y = e.clientY - state.drag.offsetY;
-      applyPosition(x, y);
+      applyPos(e.clientX - state.drag.dx, e.clientY - state.drag.dy);
       e.preventDefault();
-    }
+    });
 
-    function onPointerUp() {
-      state.drag.active = false;
-    }
-
-    header.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
-    window.addEventListener('pointercancel', onPointerUp);
+    window.addEventListener('pointerup', () => { state.drag.active = false; });
+    window.addEventListener('pointercancel', () => { state.drag.active = false; });
     window.addEventListener('resize', () => {
-      const rect = root.getBoundingClientRect();
-      if (rect.width || rect.height) applyPosition(rect.left, rect.top);
+      const r = root.getBoundingClientRect();
+      applyPos(r.left, r.top);
     });
   }
 
-  function bindUIEvents() {
+  function bindUI() {
     const ui = state.ui;
 
     ui.minBtn.addEventListener('click', () => {
@@ -391,135 +509,65 @@
     });
 
     ui.startBtn.addEventListener('click', () => {
-      runSearch().catch((e) => {
-        setStatus(`Ошибка: ${e?.message || e}`);
+      runSearch().catch(err => {
         state.running = false;
         updateButtons();
+        setStatus(`Ошибка: ${err?.message || err}`);
+        appendLog(`Search fatal: ${err?.message || err}`, 'err');
+      });
+    });
+
+    ui.exportBtn.addEventListener('click', () => {
+      exportCatalog().catch(err => {
+        state.running = false;
+        updateButtons();
+        setStatus(`Ошибка экспорта: ${err?.message || err}`);
+        appendLog(`Export fatal: ${err?.message || err}`, 'err');
       });
     });
 
     ui.stopBtn.addEventListener('click', () => {
       state.stopRequested = true;
       setStatus('Остановка...');
+      appendLog('Пользователь запросил остановку', 'warn');
     });
 
     ui.clearBtn.addEventListener('click', () => {
       state.results = [];
-      renderResults();
+      state.logs = [];
+      renderPanel();
       setStatus('Очищено');
     });
 
     ui.query.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' && !state.running) {
         e.preventDefault();
-        if (!state.running) ui.startBtn.click();
+        ui.startBtn.click();
       }
     });
 
-    ui.languageMode.addEventListener('change', () => {
-      localStorage.setItem(CFG.storage.languageMode, ui.languageMode.value);
+    ui.language.addEventListener('change', () => {
+      localStorage.setItem(CFG.storage.lang, ui.language.value);
     });
-  }
 
-  function setStatus(text) {
-    if (!state.ui.status) return;
-    state.ui.status.textContent = text;
-  }
-
-  function updateButtons() {
-    const ui = state.ui;
-    if (!ui.startBtn) return;
-    ui.startBtn.disabled = state.running;
-    ui.stopBtn.disabled = !state.running;
-  }
-
-  function renderResults() {
-    const box = state.ui.results;
-    const count = state.ui.count;
-    if (!box || !count) return;
-
-    count.textContent = String(state.results.length);
-
-    if (!state.results.length) {
-      box.innerHTML = `<div class="uf-empty">Результаты появятся здесь</div>`;
-      return;
-    }
-
-    box.innerHTML = '';
-    state.results.forEach((r, idx) => {
-      const item = document.createElement('div');
-      item.className = 'uf-item';
-      item.innerHTML = `
-        <div class="uf-top">
-          <div class="uf-badges">
-            <span class="uf-badge">${idx + 1}</span>
-            <span class="uf-badge">${escapeHtml(r.type)}</span>
-            <span class="uf-badge">page ${r.page}</span>
-            <span class="uf-badge">row ${r.rowIndex}</span>
-          </div>
-          <div class="uf-small">${escapeHtml(r.lang || '')}</div>
-        </div>
-        <div class="uf-model">${escapeHtml(r.model || '(без названия)')}</div>
-        <div class="uf-desc">${escapeHtml(r.description || '')}</div>
-        <div class="uf-actions">
-          <button class="uf-linkbtn" data-act="open">Перейти к строке</button>
-          <button class="uf-linkbtn alt" data-act="actions">Открыть Actions</button>
-        </div>`;
-
-      item.addEventListener('click', async (e) => {
-        const btn = e.target.closest('button[data-act]');
-        if (!btn) return;
-        const act = btn.getAttribute('data-act');
-        try {
-          btn.disabled = true;
-          btn.textContent = act === 'open' ? 'Переход...' : 'Открываю...';
-          if (act === 'open') await navigateToResult(r, false);
-          else await navigateToResult(r, true);
-        } catch (ex) {
-          setStatus(`Не удалось перейти: ${ex?.message || ex}`);
-        } finally {
-          btn.disabled = false;
-          btn.textContent = act === 'open' ? 'Перейти к строке' : 'Открыть Actions';
-        }
-      });
-
-      box.appendChild(item);
+    ui.exportAllLangs.addEventListener('change', () => {
+      localStorage.setItem(CFG.storage.exportAllLangs, ui.exportAllLangs.checked ? '1' : '0');
     });
+
+    ui.resultsTab.addEventListener('click', () => setPanelMode('results'));
+    ui.logsTab.addEventListener('click', () => setPanelMode('logs'));
   }
 
-  function is3DPlayerRoute() {
-    return /\/3d-player(?:\/|$)/.test(location.pathname || '');
-  }
-
-  function find3DModelsTitle() {
-    const titles = qa('h1,h2,h3');
-    return titles.find(el => /3D\s*models/i.test(normalizeText(el.textContent)));
-  }
-
-  function is3DModelsPageReady() {
-    return !!(is3DPlayerRoute() && find3DModelsTitle() && getTable());
-  }
-
-  async function waitFor3DModelsPage(timeoutMs = 15000) {
-    setStatus('Ожидание страницы 3D models...');
-    const ok = await waitUntil(() => is3DModelsPageReady(), timeoutMs, 250);
-    if (!ok) throw new Error('Страница 3D models не обнаружена');
-    setStatus('Страница 3D models обнаружена');
-    return true;
-  }
-
-  function get3DRoot() {
-    const title = find3DModelsTitle();
-    if (!title) return document.body;
-    let node = title.parentElement;
-    for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
-      if (q('table', node) && q('.mantine-Pagination-root', node)) return node;
-    }
-    return title.closest('div') || document.body;
+  function mapLangDisplayToCode(text) {
+    const t = lower(text);
+    if (!t) return null;
+    if (t.includes('english')) return 'en';
+    if (t.includes('рус') || t.includes('russian')) return 'ru';
+    return null;
   }
 
   function getTable() {
-    return q('table.mantine-Table-table') || q('table');
+    return qa('table').find(t => qa('tbody tr', t).length && qa('button[aria-haspopup="menu"]', t).length) || q('table.mantine-Table-table') || q('table');
   }
 
   function getTbody() {
@@ -535,473 +583,350 @@
 
   function getRowData(row) {
     const tds = qa('td', row);
-    const model = normalizeText(tds[0]?.innerText || tds[0]?.textContent || '');
-    const description = normalizeText(tds[1]?.innerText || tds[1]?.textContent || '');
-    const actionBtn = q('button[aria-label="Actions"]', row) || q('button', tds[2] || row);
+    const model = norm(tds[0]?.innerText || tds[0]?.textContent || '');
+    const description = norm(tds[1]?.innerText || tds[1]?.textContent || '');
+    const actionBtn = q('button[aria-haspopup="menu"]', row) || q('button', tds[2] || row);
     return { row, tds, model, description, actionBtn };
   }
 
-  function getTypeControlInputs() {
-    return qa('input.mantine-SegmentedControl-input[type="radio"]').filter(i => ['structure', 'animation'].includes(i.value));
+  function getRowsSignature(limit = 10) {
+    return getRows().slice(0, limit).map(r => {
+      const d = getRowData(r);
+      return `${lower(d.model)}||${lower(d.description)}`;
+    }).join('###');
   }
 
-  function getCurrentType() {
-    const inp = getTypeControlInputs().find(i => i.checked);
-    return inp?.value || null;
-  }
-
-  function getTypeLabelForValue(value) {
-    const inp = getTypeControlInputs().find(i => i.value === value);
-    if (!inp) return null;
-    let label = null;
-    if (inp.id) label = document.querySelector(`label[for="${CSS.escape(inp.id)}"]`);
-    return label || inp.closest('div') || inp;
-  }
-
-  async function ensureType(value) {
-    const cur = getCurrentType();
-    if (cur === value) return true;
-    setStatus(`Переключаюсь на ${capitalize(value)}...`);
-    const target = getTypeLabelForValue(value);
-    if (!target) throw new Error(`Не найден переключатель типа ${value}`);
-    clickEl(target);
-    await sleep(CFG.timings.afterTypeSwitchMs);
-    const ok = await waitUntil(() => getCurrentType() === value, CFG.timings.shortTimeoutMs, 80);
-    if (!ok) throw new Error(`Не удалось переключить тип на ${value}`);
-    return true;
-  }
-
-  function capitalize(s) {
-    return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
-  }
-
-  function findSelectWrapperByLabelText(labelNeedle) {
-    const wrappers = qa('.mantine-InputWrapper-root.mantine-Select-root');
-    return wrappers.find(w => {
-      const label = q('label', w);
-      return label && normalizeText(label.textContent).toLowerCase().includes(labelNeedle.toLowerCase());
-    }) || null;
-  }
-
-  function getSelectDisplayInput(wrapper) {
-    return wrapper ? q('input.mantine-Select-input[readonly]', wrapper) : null;
-  }
-
-  function getSelectHiddenInput(wrapper) {
-    if (!wrapper) return null;
-    return q('input[type="hidden"]', wrapper.parentElement || wrapper) || q('input[type="hidden"]', wrapper);
-  }
-
-  function getPerPageValue() {
-    const wrap = findSelectWrapperByLabelText('Per page');
-    if (!wrap) return null;
-    const hidden = getSelectHiddenInput(wrap);
-    if (hidden && /^\d+$/.test(hidden.value)) return Number(hidden.value);
-    const inp = getSelectDisplayInput(wrap);
-    const m = (inp?.value || '').match(/(\d+)/);
-    return m ? Number(m[1]) : null;
-  }
-
-  function getLanguageValue() {
-    const wrap = findSelectWrapperByLabelText('Language');
-    if (!wrap) return null;
-    const hidden = getSelectHiddenInput(wrap);
-    if (hidden && hidden.value) return String(hidden.value).toLowerCase();
-    const inp = getSelectDisplayInput(wrap);
-    const txt = normalizeText(inp?.value || '').toLowerCase();
-    if (txt.includes('english')) return 'en';
-    if (txt.includes('рус') || txt.includes('russian')) return 'ru';
-    return txt || null;
-  }
-
-  function getOpenComboboxOptions() {
-    const selectors = ['[role="option"]', '.mantine-Combobox-option', '[data-combobox-option]'];
-    const all = selectors.flatMap(s => qa(s));
-    const unique = Array.from(new Set(all));
-    return unique.filter(el => {
-      const txt = normalizeText(el.textContent);
-      if (!txt) return false;
-      const style = getComputedStyle(el);
-      return style.display !== 'none' && style.visibility !== 'hidden';
-    });
-  }
-
-  async function openSelectAndChoose(wrapper, chooserFn) {
-    const input = getSelectDisplayInput(wrapper);
-    if (!input) return false;
-    clickEl(input);
-    await sleep(CFG.timings.afterClickMs);
-
-    let options = getOpenComboboxOptions();
-    if (!options.length) options = await waitUntil(() => getOpenComboboxOptions(), 1200, 80) || [];
-    if (!options.length) return false;
-
-    const chosen = chooserFn(options);
-    if (!chosen) return false;
-    clickEl(chosen);
-    await sleep(CFG.timings.afterSelectMs);
-    return true;
-  }
-
-  async function ensurePerPage100() {
-    setStatus('Setting Per page -> 100');
-    const cur = getPerPageValue();
-    if (cur === CFG.scan.preferredPerPage) return true;
-
-    const wrap = findSelectWrapperByLabelText('Per page');
-    if (!wrap) return false;
-
-    const ok = await openSelectAndChoose(wrap, (options) => {
-      return options.find(o => /(^|\s|\/)100(\s|\/|$)/i.test(normalizeText(o.textContent))) ||
-             options.find(o => normalizeText(o.textContent).includes('100'));
-    });
-    if (!ok) return false;
-
-    await waitUntil(() => getPerPageValue() === 100, 1800, 90);
-    return true;
-  }
-
-  async function ensureLanguage(lang) {
-    if (!lang || lang === 'keep') return true;
-    const cur = getLanguageValue();
-    if (cur === lang) return true;
-
-    setStatus(`Режим языка: ${lang}`);
-    const wrap = findSelectWrapperByLabelText('Language');
-    if (!wrap) return false;
-
-    const ok = await openSelectAndChoose(wrap, (options) => {
-      const texts = options.map(o => ({ el: o, t: normalizeText(o.textContent).toLowerCase() }));
-      if (lang === 'en') return texts.find(x => x.t === 'english' || x.t.includes('english'))?.el || null;
-      if (lang === 'ru') return texts.find(x => x.t.includes('рус'))?.el || texts.find(x => x.t.includes('russian'))?.el || null;
-      return null;
-    });
-    if (!ok) return false;
-
-    await waitUntil(() => getLanguageValue() === lang, 1800, 90);
-    return true;
+  function getTotalTextNode() {
+    const nodes = qa('p,span,div');
+    return nodes.find(el => /^Total:\s*\d+$/i.test(norm(el.textContent)));
   }
 
   function parseTotalItems() {
-    const root = get3DRoot();
-    const texts = qa('.mantine-Text-root, p, span, div', root).map(el => normalizeText(el.textContent)).filter(Boolean);
-    for (const t of texts) {
-      const m = t.match(/^Total:\s*(\d+)$/i) || t.match(/\bTotal:\s*(\d+)\b/i);
-      if (m) return Number(m[1]);
-    }
-    return null;
+    const el = getTotalTextNode();
+    if (!el) return null;
+    const m = norm(el.textContent).match(/^Total:\s*(\d+)$/i);
+    return m ? Number(m[1]) : null;
   }
 
   function getPaginationRoot() {
-    return q('.mantine-Pagination-root');
+    return qa('.mantine-Pagination-root').find(isVisible) || q('.mantine-Pagination-root');
   }
 
   function getPaginationInfo() {
     const root = getPaginationRoot();
-    if (!root) return { current: null, totalPages: null };
-    const btns = qa('button', root);
+    if (!root) return { current: null, totalPages: null, buttons: [], root: null };
+    const buttons = qa('button', root).filter(isVisible);
     const curBtn = q('button[aria-current="page"]', root);
-    const current = curBtn ? Number(normalizeText(curBtn.textContent)) || null : null;
-    const numeric = btns.map(b => Number(normalizeText(b.textContent))).filter(n => Number.isFinite(n));
-    const totalPages = numeric.length ? Math.max(...numeric) : null;
-    return { current, totalPages, root, buttons: btns };
-  }
-
-  function getTableHeaders() {
-    const t = getTable();
-    if (!t) return [];
-    return qa('thead th', t).map(th => normalizeText(th.textContent)).filter(Boolean);
-  }
-
-  function getTableSnapshot() {
-    const rows = getRows();
-    const pag = getPaginationInfo();
-    return {
-      realRows: rows.length,
-      p: { current: pag.current, totalPages: pag.totalPages },
-      total: parseTotalItems(),
-      perPage: getPerPageValue(),
-      type: getCurrentType(),
-      headers: getTableHeaders()
-    };
-  }
-
-  function snapshotSignature(s, expectedPage = null) {
-    return JSON.stringify({
-      rows: s.realRows,
-      cur: s.p.current,
-      totalPages: s.p.totalPages,
-      perPage: s.perPage,
-      type: s.type,
-      headers: s.headers,
-      expectedPage
-    });
-  }
-
-  async function waitForTableStable(label, opts = {}) {
-    const timeoutMs = opts.timeoutMs ?? CFG.timings.pageStableTimeoutMs;
-    const expectedPage = opts.expectedPage ?? null;
-    const requireRows = !!opts.requireRows;
-
-    let lastSig = null;
-    let lastChange = 0;
-    let lastSnap = null;
-    const t0 = Date.now();
-
-    while (Date.now() - t0 < timeoutMs) {
-      const snap = getTableSnapshot();
-      lastSnap = snap;
-      const sig = snapshotSignature(snap, expectedPage);
-
-      if (sig !== lastSig) {
-        lastSig = sig;
-        lastChange = Date.now();
-      }
-
-      const pageOk = expectedPage == null || snap.p.current === expectedPage;
-      const rowsOk = requireRows ? snap.realRows > 0 : true;
-      const tableOk = !!getTable();
-
-      if (tableOk && pageOk && rowsOk && (Date.now() - lastChange) >= CFG.timings.stableForMs) return snap;
-      await sleep(CFG.timings.pollMs);
-    }
-
-    return lastSnap || getTableSnapshot();
-  }
-
-  function findPageButton(pageNum) {
-    const root = getPaginationRoot();
-    if (!root) return null;
-    return qa('button', root).find(b => normalizeText(b.textContent) === String(pageNum));
+    const current = curBtn ? Number(norm(curBtn.textContent)) || null : null;
+    const nums = buttons.map(b => Number(norm(b.textContent))).filter(n => Number.isFinite(n));
+    const totalPages = nums.length ? Math.max(...nums) : null;
+    return { current, totalPages, buttons, root };
   }
 
   function getPrevNextButtons() {
     const root = getPaginationRoot();
     if (!root) return { prev: null, next: null };
-    const btns = qa('button', root);
+    const btns = qa('button', root).filter(isVisible);
     if (btns.length < 2) return { prev: null, next: null };
     return { prev: btns[0], next: btns[btns.length - 1] };
   }
 
-  async function goToPage(pageNum) {
-    const target = Number(pageNum);
-    if (!Number.isFinite(target) || target < 1) return false;
+  function findPageButton(page) {
+    const root = getPaginationRoot();
+    if (!root) return null;
+    return qa('button', root).find(b => norm(b.textContent) === String(page));
+  }
 
-    let info = getPaginationInfo();
-    if (info.current === target) return true;
+  function getTypeInputs() {
+    return qa('input[type="radio"]').filter(i => ['structure', 'animation'].includes(String(i.value || '').toLowerCase()));
+  }
 
-    let btn = findPageButton(target);
-    if (btn) {
-      clickEl(btn);
-      await sleep(CFG.timings.afterPageClickMs);
-      const ok = await waitUntil(() => getPaginationInfo().current === target, 1800, 90);
-      return !!ok;
+  function getCurrentType() {
+    const inp = getTypeInputs().find(i => i.checked);
+    return inp ? String(inp.value).toLowerCase() : null;
+  }
+
+  function getTypeLabel(value) {
+    const inp = getTypeInputs().find(i => String(i.value).toLowerCase() === value);
+    if (!inp) return null;
+    if (inp.id) {
+      const esc = window.CSS && CSS.escape ? CSS.escape(inp.id) : inp.id.replace(/"/g, '\\"');
+      const lbl = document.querySelector(`label[for="${esc}"]`);
+      if (lbl) return lbl;
+    }
+    return inp.closest('label') || inp.closest('div') || inp;
+  }
+
+  async function ensureType(value) {
+    value = String(value).toLowerCase();
+    if (getCurrentType() === value) return true;
+    const target = getTypeLabel(value);
+    if (!target) throw new Error(`Не найден переключатель типа ${value}`);
+    const beforeSig = getRowsSignature();
+    clickEl(target);
+    await sleep(CFG.timings.typeSwitchMs);
+    await waitUntil(() => getCurrentType() === value, CFG.timings.shortTimeoutMs, 70);
+    await waitForFreshRows({ expectedPage: 1, prevRowsSig: beforeSig, timeoutMs: CFG.timings.searchPageReadyMs, allowSameRows: false });
+    if (getCurrentType() !== value) throw new Error(`Не удалось переключить тип на ${value}`);
+    appendLog(`Тип переключен: ${value}`, 'ok');
+    return true;
+  }
+
+  function getHiddenInputForSelectWrapper(wrapper) {
+    if (!wrapper) return null;
+
+    let n = wrapper.nextElementSibling;
+    while (n) {
+      if (n.matches && n.matches('input[type="hidden"]')) return n;
+      if (n.matches && n.matches('.mantine-InputWrapper-root, .mantine-Select-root')) break;
+      n = n.nextElementSibling;
     }
 
-    const maxHops = 80;
-    for (let hop = 0; hop < maxHops; hop++) {
-      info = getPaginationInfo();
-      if (info.current === target) return true;
-      const { prev, next } = getPrevNextButtons();
-      const stepBtn = (info.current && info.current < target) ? next : prev;
-      if (!stepBtn) break;
-      clickEl(stepBtn);
-      await sleep(CFG.timings.afterPageClickMs);
-
-      const changed = await waitUntil(() => {
-        const c = getPaginationInfo().current;
-        return c && c !== info.current;
-      }, 1500, 80);
-
-      if (!changed) break;
-
-      btn = findPageButton(target);
-      if (btn) {
-        clickEl(btn);
-        await sleep(CFG.timings.afterPageClickMs);
-        const ok = await waitUntil(() => getPaginationInfo().current === target, 1800, 90);
-        return !!ok;
+    const parent = wrapper.parentElement;
+    if (parent) {
+      const children = Array.from(parent.children);
+      const idx = children.indexOf(wrapper);
+      for (let i = idx + 1; i < children.length; i++) {
+        const el = children[i];
+        if (el.matches?.('input[type="hidden"]')) return el;
+        if (el.matches?.('.mantine-InputWrapper-root, .mantine-Select-root')) break;
       }
     }
 
-    return false;
+    return null;
   }
 
-  function collectMatchesOnCurrentPage(matcher, scanLang) {
+  function getLanguageSelectWrapper() {
+    const wrappers = qa('.mantine-Select-root').filter(isVisible);
+    for (const w of wrappers) {
+      const display = q('input.mantine-Select-input[readonly]', w);
+      if (!display) continue;
+      const hidden = getHiddenInputForSelectWrapper(w);
+      const hv = String(hidden?.value || '').toLowerCase();
+      const dv = mapLangDisplayToCode(display.value);
+      if (['en', 'ru'].includes(hv) || dv) return w;
+    }
+    return null;
+  }
+
+  function getLanguageValue() {
+    const w = getLanguageSelectWrapper();
+    if (!w) return null;
+    const hidden = getHiddenInputForSelectWrapper(w);
+    const hv = String(hidden?.value || '').toLowerCase();
+    if (['en', 'ru'].includes(hv)) return hv;
+    const display = q('input.mantine-Select-input[readonly]', w);
+    return mapLangDisplayToCode(display?.value || '') || null;
+  }
+
+  function getOpenOptions() {
+    const selectors = ['[role="option"]', '.mantine-Combobox-option', '[data-combobox-option]'];
+    const all = selectors.flatMap(s => qa(s));
+    return Array.from(new Set(all)).filter(isVisible).filter(el => norm(el.textContent));
+  }
+
+  async function closePopups() {
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', bubbles: true }));
+    } catch {}
+    await sleep(70);
+  }
+
+  async function openSelectAndChoose(wrapper, chooser) {
+    const input = q('input.mantine-Select-input[readonly]', wrapper);
+    if (!input) return false;
+    clickEl(input);
+    await sleep(CFG.timings.clickSettleMs);
+
+    let opts = getOpenOptions();
+    if (!opts.length) opts = await waitUntil(() => getOpenOptions(), 1200, 60) || [];
+    if (!opts.length) return false;
+
+    const chosen = chooser(opts);
+    if (!chosen) {
+      await closePopups();
+      return false;
+    }
+
+    clickEl(chosen);
+    await sleep(CFG.timings.clickSettleMs);
+    return true;
+  }
+
+  async function ensureLanguage(lang) {
+    if (!lang || lang === 'keep') return true;
+    if (!['en', 'ru'].includes(lang)) return false;
+
+    for (let attempt = 1; attempt <= CFG.retries.langSwitch; attempt++) {
+      const current = getLanguageValue();
+      if (current === lang) return true;
+
+      const wrapper = getLanguageSelectWrapper();
+      if (!wrapper) return false;
+
+      const beforeSig = getRowsSignature();
+      const ok = await openSelectAndChoose(wrapper, opts => opts.find(o => mapLangDisplayToCode(o.textContent) === lang) || null);
+      if (!ok) {
+        await sleep(120 * attempt);
+        continue;
+      }
+
+      await waitUntil(() => getLanguageValue() === lang, 1800, 70);
+      await waitForFreshRows({ prevRowsSig: beforeSig, timeoutMs: CFG.timings.searchPageReadyMs, allowSameRows: false });
+      if (getLanguageValue() === lang) {
+        appendLog(`Язык переключен: ${lang}`, 'ok');
+        return true;
+      }
+
+      await sleep(120 * attempt);
+    }
+
+    return getLanguageValue() === lang;
+  }
+
+  function hasModelsTableUI() {
+    const table = getTable();
     const rows = getRows();
-    const matches = [];
+    const hasActions = !!q('button[aria-haspopup="menu"]', table || document);
+    const pag = getPaginationRoot();
+    const total = getTotalTextNode();
+    return !!table && !!hasActions && (!!rows.length || !!pag || !!total);
+  }
 
-    rows.forEach((tr, idx) => {
-      const rd = getRowData(tr);
-      const hay = `${rd.model}\n${rd.description}`;
-      if (!matcher.test(hay)) return;
+  async function waitFor3DModelsPage(timeoutMs = 12000) {
+    setStatus('Ожидание страницы 3D models...');
+    const ok = await waitUntil(() => hasModelsTableUI(), timeoutMs, 160);
+    if (!ok) throw new Error('Страница 3D models не обнаружена');
+    setStatus('Страница 3D models обнаружена');
+    appendLog('Страница 3D models обнаружена', 'ok');
+    return true;
+  }
 
-      matches.push({
-        type: getCurrentType() || 'unknown',
-        page: getPaginationInfo().current || 1,
-        rowIndex: idx + 1,
-        model: rd.model,
-        description: rd.description,
-        lang: scanLang || getLanguageValue() || '',
-        key: makeResultKey(rd.model, rd.description)
+  function getTableSnapshot() {
+    const rows = getRows();
+    const p = getPaginationInfo();
+    return {
+      rows: rows.length,
+      current: p.current,
+      totalPages: p.totalPages,
+      total: parseTotalItems(),
+      type: getCurrentType(),
+      lang: getLanguageValue(),
+      rowsSig: getRowsSignature()
+    };
+  }
+
+  async function waitForFreshRows(opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? CFG.timings.searchPageReadyMs;
+    const expectedPage = opts.expectedPage ?? null;
+    const prevRowsSig = opts.prevRowsSig ?? null;
+    const allowSameRows = !!opts.allowSameRows;
+    const requireRows = opts.requireRows !== false;
+
+    let lastSig = '';
+    let lastChange = Date.now();
+    let lastSnap = getTableSnapshot();
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      const snap = getTableSnapshot();
+      lastSnap = snap;
+      const stableSig = JSON.stringify({
+        current: snap.current,
+        rows: snap.rows,
+        rowsSig: snap.rowsSig,
+        type: snap.type,
+        lang: snap.lang
       });
-    });
 
-    return matches;
+      if (stableSig !== lastSig) {
+        lastSig = stableSig;
+        lastChange = Date.now();
+      }
+
+      const pageOk = expectedPage == null || snap.current === expectedPage;
+      const rowsOk = !requireRows || snap.rows > 0;
+      const freshOk = allowSameRows || !prevRowsSig || (snap.rowsSig && snap.rowsSig !== prevRowsSig);
+
+      if (pageOk && rowsOk && freshOk && (Date.now() - lastChange) >= CFG.timings.stableForMs) {
+        return snap;
+      }
+
+      await sleep(CFG.timings.pollMs);
+    }
+
+    return lastSnap;
   }
 
-  function makeResultKey(model, desc) {
-    return normalizeText(`${model}||${desc}`).toLowerCase();
-  }
-
-  async function scanType(typeName, matcher, scanLang) {
-    await ensureType(typeName);
-    await ensurePerPage100();
-    await waitForTableStable(`before scan ${typeName}`, { requireRows: true, timeoutMs: 2200 });
+  async function goToPageSimple(targetPage) {
+    targetPage = Number(targetPage);
+    if (!Number.isFinite(targetPage) || targetPage < 1) return false;
 
     let info = getPaginationInfo();
-    const perPage = getPerPageValue() || 100;
-    const totalItems = parseTotalItems();
-    let totalPages = info.totalPages || null;
-    if (!totalPages && totalItems && perPage) totalPages = Math.ceil(totalItems / perPage);
-    if (!totalPages) totalPages = 1;
+    if (info.current === targetPage) return true;
 
-    await goToPage(1);
-    await waitForTableStable(`page 1 settled (${typeName})`, { expectedPage: 1, requireRows: true, timeoutMs: 2200 });
+    const maxSteps = 120;
 
-    for (let page = 1; page <= totalPages; page++) {
-      if (state.stopRequested) return;
+    for (let i = 0; i < maxSteps; i++) {
+      info = getPaginationInfo();
+      if (info.current === targetPage) return true;
 
-      setStatus(`Поиск: ${capitalize(typeName)} | страница ${page}/${totalPages}...`);
-
-      if (page > 1) {
-        const okPage = await goToPage(page);
-        if (!okPage) {}
+      let btn = findPageButton(targetPage);
+      if (!btn) {
+        const { prev, next } = getPrevNextButtons();
+        btn = (info.current && info.current < targetPage) ? next : prev;
       }
 
-      let snap = await waitForTableStable(`scan page ${page} (${typeName})`, {
-        expectedPage: page,
-        requireRows: true,
-        timeoutMs: CFG.timings.pageStableTimeoutMs
+      if (!btn || btn.disabled) break;
+
+      const beforePage = info.current;
+      clickEl(btn);
+      await sleep(CFG.timings.clickSettleMs);
+
+      await waitUntil(() => {
+        const now = getPaginationInfo().current;
+        return now && now !== beforePage;
+      }, CFG.timings.pageChangeTimeoutMs, 70);
+
+      if (getPaginationInfo().current === targetPage) return true;
+    }
+
+    return getPaginationInfo().current === targetPage;
+  }
+
+  async function ensurePageReady(targetPage, prevRowsSig, mode = 'search') {
+    const timeoutMs = mode === 'export' ? CFG.timings.exportPageReadyMs : CFG.timings.searchPageReadyMs;
+
+    for (let attempt = 1; attempt <= CFG.retries.pageReady; attempt++) {
+      if (state.stopRequested) return null;
+
+      const ok = await goToPageSimple(targetPage);
+      if (!ok) {
+        await sleep(180 * attempt);
+        continue;
+      }
+
+      const snap = await waitForFreshRows({
+        expectedPage: targetPage,
+        prevRowsSig,
+        allowSameRows: targetPage === 1,
+        timeoutMs
       });
 
-      let rowsCount = snap?.realRows ?? getRows().length;
-      let attempt = 0;
-
-      while (rowsCount === 0 && attempt < CFG.scan.emptyPageRetries) {
-        attempt++;
-        await sleep(CFG.scan.pageRetrySleepMs);
-        const btn = findPageButton(page);
-        if (btn) clickEl(btn);
-        await sleep(CFG.timings.afterPageClickMs);
-        snap = await waitForTableStable(`scan page ${page} retry ${attempt} (${typeName})`, {
-          expectedPage: page,
-          requireRows: false,
-          timeoutMs: 1800
-        });
-        rowsCount = snap?.realRows ?? getRows().length;
+      const freshOk = targetPage === 1 || !prevRowsSig || snap.rowsSig !== prevRowsSig;
+      if (snap.current === targetPage && snap.rows > 0 && freshOk) {
+        return snap;
       }
 
-      const found = collectMatchesOnCurrentPage(matcher, scanLang);
-      if (found.length) {
-        for (const f of found) {
-          const dup = state.results.find(r => r.type === f.type && r.page === f.page && r.key === f.key);
-          if (!dup) state.results.push(f);
-        }
-        renderResults();
-      }
+      appendLog(`Страница ${targetPage}: ещё старые строки, повтор ${attempt}/${CFG.retries.pageReady}`, 'warn');
+      await sleep(CFG.timings.exportRetryDelayMs * attempt);
     }
+
+    return null;
   }
 
-  async function runSearch() {
-    if (state.running) return;
-
-    const ui = state.ui;
-    const query = ui.query.value.trim();
-    if (!query) {
-      setStatus('Введите запрос');
-      return;
-    }
-
-    localStorage.setItem(CFG.storage.query, query);
-    localStorage.setItem(CFG.storage.languageMode, ui.languageMode.value);
-
-    const opts = {
-      scanStructure: !!ui.scanStructure.checked,
-      scanAnimation: !!ui.scanAnimation.checked,
-      caseSensitive: !!ui.caseSensitive.checked,
-      useRegex: !!ui.useRegex.checked,
-      languageMode: ui.languageMode.value
-    };
-
-    if (!opts.scanStructure && !opts.scanAnimation) {
-      setStatus('Выберите хотя бы один тип (Structure/Animation)');
-      return;
-    }
-
-    let matcher;
-    try {
-      matcher = buildMatcher(query, opts);
-    } catch (e) {
-      setStatus(`Ошибка regex: ${e.message || e}`);
-      return;
-    }
-
-    state.running = true;
-    state.stopRequested = false;
-    state.results = [];
-    state.searchMeta = { query, ...opts };
-    renderResults();
-    updateButtons();
-
-    try {
-      await waitFor3DModelsPage();
-      setStatus('Подготовка страницы...');
-      await waitForTableStable('initial settle', { requireRows: true, timeoutMs: 2200 });
-
-      let scanLang = null;
-      if (opts.languageMode === 'auto') {
-        scanLang = detectQueryLanguage(query);
-        setStatus(`Режим языка: авто${scanLang ? ` (${scanLang})` : ''}`);
-      } else if (opts.languageMode === 'ru' || opts.languageMode === 'en') {
-        scanLang = opts.languageMode;
-        setStatus(`Режим языка: ${scanLang}`);
-      } else {
-        scanLang = null;
-        setStatus('Режим языка: keep');
-      }
-
-      if (scanLang) {
-        await ensureLanguage(scanLang);
-        await waitForTableStable('after language switch', { requireRows: true, timeoutMs: 2200 });
-      }
-
-      await ensurePerPage100();
-      await waitForTableStable('after per-page switch', { requireRows: true, timeoutMs: 2200 });
-
-      const types = [];
-      if (opts.scanStructure) types.push('structure');
-      if (opts.scanAnimation) types.push('animation');
-
-      for (const type of types) {
-        if (state.stopRequested) break;
-        await scanType(type, matcher, scanLang || getLanguageValue() || '');
-      }
-
-      if (state.stopRequested) setStatus(`Остановлено. Найдено: ${state.results.length}`);
-      else {
-        setStatus(`Готово. Найдено: ${state.results.length}`);
-        if (!state.results.length) setStatus('Готово. Найдено: 0');
-      }
-    } finally {
-      state.running = false;
-      state.stopRequested = false;
-      updateButtons();
-      renderResults();
-    }
-  }
-
-  function clearRowHighlight() {
+  function clearHighlight() {
     if (state.lastHighlightedRow && state.lastHighlightedRow.isConnected) {
       state.lastHighlightedRow.classList.remove('uf-highlight-row');
     }
@@ -1009,7 +934,7 @@
   }
 
   function flashRow(row) {
-    clearRowHighlight();
+    clearHighlight();
     if (!row) return;
     row.classList.add('uf-highlight-row');
     try { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
@@ -1020,108 +945,669 @@
     }, CFG.timings.flashMs);
   }
 
-  function findRowByResult(result) {
+  function findRowForResult(result) {
     const rows = getRows();
-    const targetModel = normalizeText(result.model).toLowerCase();
-    const targetDesc = normalizeText(result.description).toLowerCase();
+    const targetModel = lower(result.model);
+    const targetDesc = lower(result.description);
 
     for (const tr of rows) {
       const rd = getRowData(tr);
-      if (normalizeText(rd.model).toLowerCase() === targetModel && normalizeText(rd.description).toLowerCase() === targetDesc) {
-        return { tr, rd };
-      }
+      if (lower(rd.model) === targetModel && lower(rd.description) === targetDesc) return { tr, rd };
     }
 
     for (const tr of rows) {
       const rd = getRowData(tr);
-      if (normalizeText(rd.model).toLowerCase() === targetModel) return { tr, rd };
+      if (lower(rd.model) === targetModel) return { tr, rd };
     }
 
-    for (const tr of rows) {
-      const rd = getRowData(tr);
-      const m = normalizeText(rd.model).toLowerCase();
-      const d = normalizeText(rd.description).toLowerCase();
-      if (m.includes(targetModel) || targetModel.includes(m) || (targetDesc && d.includes(targetDesc.slice(0, Math.min(40, targetDesc.length))))) {
-        return { tr, rd };
-      }
-    }
-
-    const tr = rows[result.rowIndex - 1];
-    if (tr) return { tr, rd: getRowData(tr) };
     return null;
   }
 
   async function navigateToResult(result, openActions = false) {
-    if (state.running) throw new Error('Сначала дождитесь окончания поиска');
+    if (state.running) throw new Error('Дождитесь окончания операции');
 
-    await waitFor3DModelsPage(10000);
+    await waitFor3DModelsPage();
+
+    if (result.lang && result.lang !== 'keep') {
+      const okLang = await ensureLanguage(result.lang);
+      if (!okLang) throw new Error(`Не удалось переключить язык на ${result.lang}`);
+    }
+
     await ensureType(result.type);
-    await ensurePerPage100();
 
-    const ok = await goToPage(result.page);
-    if (!ok) throw new Error(`Не удалось перейти на страницу ${result.page}`);
+    const snap = await ensurePageReady(result.page, null, 'search');
+    if (!snap || snap.current !== result.page || snap.rows < 1) {
+      throw new Error(`Не удалось открыть страницу ${result.page}`);
+    }
 
-    await waitForTableStable(`navigate result page ${result.page}`, {
-      expectedPage: result.page,
-      requireRows: true,
-      timeoutMs: 2600
-    });
-
-    const hit = findRowByResult(result);
-    if (!hit) throw new Error('Строка результата не найдена на странице');
+    const hit = findRowForResult(result);
+    if (!hit) throw new Error('Строка на странице не найдена');
 
     flashRow(hit.tr);
     setStatus(`Открыт результат: ${result.model}`);
 
     if (openActions) {
       if (!hit.rd.actionBtn) throw new Error('Кнопка Actions не найдена');
+      await sleep(60);
       clickEl(hit.rd.actionBtn);
-      setStatus(`Actions открыто: ${result.model}`);
     }
-
-    return true;
   }
 
-  function attachRouteWatcher() {
-    if (state._routeWatcherAttached) return;
-    state._routeWatcherAttached = true;
+  function makeMatcher(query) {
+    const needle = lower(query);
+    return {
+      test(text) {
+        return lower(text).includes(needle);
+      }
+    };
+  }
 
-    const origPush = history.pushState;
-    const origReplace = history.replaceState;
+  function collectMatchesCurrentPage(matcher, scanLang, typeName, pageNum) {
+    const rows = getRows();
+    const out = [];
 
-    function onRouteMaybeChanged() {
-      setTimeout(() => {
-        if (state.routePath !== location.pathname) {
-          state.routePath = location.pathname;
-          if (is3DPlayerRoute()) setStatus('Ожидание страницы 3D models...');
-        }
-      }, 0);
+    rows.forEach((row, idx) => {
+      const rd = getRowData(row);
+      const hay = `${rd.model}\n${rd.description}`;
+      if (!matcher.test(hay)) return;
+
+      out.push({
+        lang: scanLang || getLanguageValue() || '',
+        type: typeName || getCurrentType() || 'unknown',
+        page: pageNum || getPaginationInfo().current || 1,
+        rowIndex: idx + 1,
+        model: rd.model,
+        description: rd.description
+      });
+    });
+
+    return out;
+  }
+
+  async function scanType(typeName, matcher, langCode) {
+    await ensureType(typeName);
+
+    let prevSig = null;
+    const snap1 = await ensurePageReady(1, null, 'search');
+    if (!snap1) throw new Error(`Не удалось открыть страницу 1 для ${typeName}`);
+
+    const firstRows = getRows().length || 20;
+    const totalItems = parseTotalItems();
+    const pInfo = getPaginationInfo();
+    let totalPages = pInfo.totalPages || null;
+    if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / firstRows);
+    if (!totalPages) totalPages = 1;
+
+    appendLog(`Сканирование ${typeName}, язык ${langCode}, страниц: ${totalPages}`, 'info');
+
+    for (let page = 1; page <= totalPages; page++) {
+      if (state.stopRequested) return;
+
+      setStatus(`Поиск: ${typeName} | страница ${page}/${totalPages}...`);
+
+      const snap = await ensurePageReady(page, prevSig, 'search');
+      if (!snap) {
+        appendLog(`Страница ${page}: не удалось получить свежие строки (${typeName})`, 'warn');
+        continue;
+      }
+
+      const found = collectMatchesCurrentPage(matcher, langCode, typeName, page);
+      for (const f of found) addResult(f);
+
+      prevSig = snap.rowsSig;
+
+      if (found.length) appendLog(`Страница ${page}: найдено ${found.length}`, 'ok');
+      renderResults();
+    }
+  }
+
+  function getOpenMenus() {
+    const selectors = ['.mantine-Menu-dropdown', '[role="menu"]', '[id$="-dropdown"]'];
+    return Array.from(new Set(selectors.flatMap(s => qa(s)))).filter(isVisible);
+  }
+
+  function getMenuItems(menu) {
+    return qa('button[role="menuitem"], button[data-menu-item="true"], [role="menuitem"]', menu).filter(isVisible);
+  }
+
+  function validEmbedValue(text) {
+    const s = String(text || '').trim();
+    if (!s) return '';
+    if (/<iframe\b/i.test(s) && /src=/i.test(s) && /\/3d-player\//i.test(s)) return s;
+    const m = s.match(/https?:\/\/[^\s"'<>]+\/3d-player\/[^\s"'<>]+/i);
+    if (m) {
+      const url = m[0];
+      return `<iframe src="${url}" style="border:0;width:100%;height:400px" allow="fullscreen; autoplay; clipboard-read; clipboard-write"></iframe>`;
+    }
+    return '';
+  }
+
+  async function readClipboardTextSafe() {
+    if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+      try {
+        return String(await navigator.clipboard.readText() || '');
+      } catch {}
+    }
+    return '';
+  }
+
+  async function captureClipboardTextByClick(el) {
+    let captured = '';
+    let patched = false;
+    let originalWrite = null;
+
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        originalWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+        navigator.clipboard.writeText = async (text) => {
+          captured = String(text || '');
+          return Promise.resolve();
+        };
+        patched = true;
+      }
+    } catch {}
+
+    try {
+      clickEl(el);
+      await sleep(CFG.timings.menuActionMs);
+      if (!captured) {
+        const clip = await readClipboardTextSafe();
+        if (clip) captured = clip;
+      }
+    } finally {
+      if (patched && originalWrite) {
+        try { navigator.clipboard.writeText = originalWrite; } catch {}
+      }
     }
 
-    history.pushState = function (...args) {
-      const r = origPush.apply(this, args);
-      onRouteMaybeChanged();
-      return r;
-    };
+    return String(captured || '').trim();
+  }
 
-    history.replaceState = function (...args) {
-      const r = origReplace.apply(this, args);
-      onRouteMaybeChanged();
-      return r;
-    };
+  async function extractEmbedFromRow(row) {
+    const rd = getRowData(row);
+    if (!rd.actionBtn) return '';
 
-    window.addEventListener('popstate', onRouteMaybeChanged);
+    await closePopups();
+    clickEl(rd.actionBtn);
+    await sleep(CFG.timings.menuOpenMs);
+
+    const menu = await waitUntil(() => getOpenMenus()[0], 1200, 50);
+    if (!menu) return '';
+
+    const items = getMenuItems(menu);
+    const embedItem =
+      items.find(i => lower(i.textContent).includes('встроить')) ||
+      items.find(i => lower(i.textContent).includes('embed'));
+
+    if (!embedItem) {
+      await closePopups();
+      return '';
+    }
+
+    const captured = await captureClipboardTextByClick(embedItem);
+    const valid = validEmbedValue(captured);
+    await closePopups();
+    return valid;
+  }
+
+  function findRowByIdentity(identity) {
+    const rows = getRows();
+    const targetModel = lower(identity.model);
+    const targetDesc = lower(identity.description);
+
+    for (const row of rows) {
+      const rd = getRowData(row);
+      if (lower(rd.model) === targetModel && lower(rd.description) === targetDesc) return row;
+    }
+
+    for (const row of rows) {
+      const rd = getRowData(row);
+      if (lower(rd.model) === targetModel) return row;
+    }
+
+    return null;
+  }
+
+  function findRowByIndexAndIdentity(rowIndex, identity) {
+    const rows = getRows();
+    const idx = Math.max(0, rowIndex - 1);
+
+    if (rows[idx]) {
+      const rd = getRowData(rows[idx]);
+      if (lower(rd.model) === lower(identity.model)) return rows[idx];
+    }
+
+    return findRowByIdentity(identity);
+  }
+
+  async function extractEmbedWithAttempts(row, label) {
+    for (let attempt = 1; attempt <= CFG.retries.embedFast; attempt++) {
+      const embed = await extractEmbedFromRow(row);
+      if (validEmbedValue(embed)) return embed;
+      if (attempt < CFG.retries.embedFast) {
+        appendLog(`Fast retry ${attempt}/${CFG.retries.embedFast - 1}: ${label}`, 'warn');
+        await sleep(CFG.timings.exportRetryDelayMs);
+      }
+    }
+    return '';
+  }
+
+  async function restoreExportContext(ctx, prevPageSig) {
+    const okLang = await ensureLanguage(ctx.language);
+    if (!okLang) return null;
+
+    await ensureType(ctx.type);
+    return await ensurePageReady(ctx.page, prevPageSig, 'export');
+  }
+
+  async function extractEmbedWithRecovery(identity, ctx, prevPageSig) {
+    let lastError = '';
+
+    for (let attempt = 1; attempt <= CFG.retries.embedRecovery; attempt++) {
+      if (state.stopRequested) return { ok: false, embed: '', error: 'stopped' };
+
+      appendLog(`Recovery ${attempt}/${CFG.retries.embedRecovery}: ${identity.model} | ${ctx.language} | ${ctx.type} | page ${ctx.page}`, 'warn');
+
+      const snap = await restoreExportContext(ctx, prevPageSig);
+      if (!snap) {
+        lastError = `Не удалось восстановить контекст page ${ctx.page}`;
+        await sleep(CFG.timings.exportRetryDelayMs * attempt);
+        continue;
+      }
+
+      let row = null;
+      for (let refind = 1; refind <= CFG.retries.refindRow; refind++) {
+        row = findRowByIndexAndIdentity(identity.rowIndex, identity);
+        if (row) break;
+        await sleep(120 * refind);
+      }
+
+      if (!row) {
+        lastError = 'Строка не найдена после возврата на страницу';
+        await sleep(CFG.timings.exportRetryDelayMs * attempt);
+        continue;
+      }
+
+      const embed = await extractEmbedWithAttempts(row, identity.model);
+      if (validEmbedValue(embed)) {
+        appendLog(`Recovery success: ${identity.model}`, 'ok');
+        return { ok: true, embed, error: '' };
+      }
+
+      lastError = 'Пустой iframe после recovery';
+      await sleep(CFG.timings.exportRetryDelayMs * attempt);
+    }
+
+    return { ok: false, embed: '', error: lastError || 'Не удалось получить iframe' };
+  }
+
+  function csvEscape(v) {
+    return `"${String(v ?? '').replace(/"/g, '""')}"`;
+  }
+
+  function buildCsv(rows) {
+    const header = ['language', 'type', 'page', 'model', 'description', 'embed_iframe'];
+    const lines = [header.map(csvEscape).join(';')];
+    for (const r of rows) {
+      lines.push([
+        r.language,
+        r.type,
+        r.page,
+        r.model,
+        r.description,
+        r.embed_iframe
+      ].map(csvEscape).join(';'));
+    }
+    return '\uFEFF' + lines.join('\r\n');
+  }
+
+  function buildFailuresCsv(rows) {
+    const header = ['language', 'type', 'page', 'model', 'description', 'error'];
+    const lines = [header.map(csvEscape).join(';')];
+    for (const r of rows) {
+      lines.push([
+        r.language,
+        r.type,
+        r.page,
+        r.model,
+        r.description,
+        r.error
+      ].map(csvEscape).join(';'));
+    }
+    return '\uFEFF' + lines.join('\r\n');
+  }
+
+  function downloadTextFile(filename, text, mime = 'text/plain;charset=utf-8') {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2500);
+  }
+
+  function fileStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  async function runSearch() {
+    if (state.running) return;
+
+    const query = state.ui.query.value.trim();
+    if (!query) {
+      setStatus('Введите запрос');
+      return;
+    }
+
+    const types = selectedTypesFromUI();
+    let lang = state.ui.language.value || 'keep';
+
+    if (lang === 'keep') lang = isCyr(query) ? 'ru' : 'en';
+    if (!['en', 'ru'].includes(lang)) lang = isCyr(query) ? 'ru' : 'en';
+
+    if (!types.length) {
+      setStatus('Выберите хотя бы один тип');
+      return;
+    }
+
+    localStorage.setItem(CFG.storage.query, query);
+    localStorage.setItem(CFG.storage.lang, state.ui.language.value);
+
+    state.running = true;
+    state.stopRequested = false;
+    state.results = [];
+    updateButtons();
+    setPanelMode('results');
+    renderResults();
+
+    try {
+      await waitFor3DModelsPage();
+      setStatus('Подготовка страницы...');
+      appendLog(`Start search: "${query}" | lang=${lang} | types=${types.join(',')}`, 'info');
+
+      const okLang = await ensureLanguage(lang);
+      if (!okLang) {
+        appendLog(`Не удалось переключить язык на ${lang}, продолжаю как есть`, 'warn');
+      }
+
+      const matcher = makeMatcher(query);
+      for (const type of types) {
+        if (state.stopRequested) break;
+        await scanType(type, matcher, lang);
+      }
+
+      setStatus(state.stopRequested ? `Остановлено. Найдено: ${state.results.length}` : `Готово. Найдено: ${state.results.length}`);
+      appendLog(`Search done. Found: ${state.results.length}`, 'ok');
+    } finally {
+      state.running = false;
+      state.stopRequested = false;
+      updateButtons();
+      renderResults();
+    }
+  }
+
+  async function exportCatalog() {
+    if (state.running) return;
+
+    state.running = true;
+    state.stopRequested = false;
+    state.failures = [];
+    state.logs = [];
+    updateButtons();
+    setPanelMode('logs');
+
+    try {
+      await waitFor3DModelsPage();
+      setStatus('Подготовка экспорта...');
+      appendLog('Экспорт запущен', 'info');
+
+      const exportAllLangs = !!state.ui.exportAllLangs.checked;
+      const selectedTypes = selectedTypesFromUI();
+
+      if (!selectedTypes.length) {
+        throw new Error('Для экспорта не выбран ни один тип');
+      }
+
+      let languages = [];
+      if (exportAllLangs) {
+        const available = [];
+        const wrapper = getLanguageSelectWrapper();
+
+        if (wrapper) {
+          const input = q('input.mantine-Select-input[readonly]', wrapper);
+          const originalCode = getLanguageValue();
+          const originalDisplay = input ? norm(input.value) : '';
+
+          clickEl(input);
+          await sleep(CFG.timings.clickSettleMs);
+
+          let opts = getOpenOptions();
+          if (!opts.length) opts = await waitUntil(() => getOpenOptions(), 1200, 60) || [];
+
+          for (const o of opts) {
+            const code = mapLangDisplayToCode(o.textContent);
+            const label = norm(o.textContent);
+            if (code && !available.some(x => x.value === code)) {
+              available.push({ value: code, label });
+            }
+          }
+
+          await closePopups();
+
+          if (!available.length && originalCode && ['en', 'ru'].includes(originalCode)) {
+            available.push({ value: originalCode, label: originalDisplay || originalCode });
+          }
+        }
+
+        if (!available.length) {
+          available.push({ value: 'en', label: 'English' }, { value: 'ru', label: 'Русский' });
+        }
+
+        languages = available.filter(x => ['en', 'ru'].includes(x.value));
+      } else {
+        const selected = state.ui.language.value || 'keep';
+        if (selected === 'keep') {
+          const current = getLanguageValue() || 'en';
+          languages = [{ value: ['en', 'ru'].includes(current) ? current : 'en', label: current }];
+        } else {
+          languages = [{ value: ['en', 'ru'].includes(selected) ? selected : 'en', label: selected }];
+        }
+      }
+
+      appendLog(`Языки для экспорта: ${languages.map(x => x.value).join(', ')}`, 'info');
+      appendLog(`Типы для экспорта: ${selectedTypes.join(', ')}`, 'info');
+
+      const out = [];
+      const uniqueOut = new Set();
+
+      for (const lang of languages) {
+        if (state.stopRequested) break;
+
+        appendLog(`--- Язык: ${lang.value} ---`, 'info');
+        const okLang = await ensureLanguage(lang.value);
+        if (!okLang) {
+          const err = `Не удалось переключить язык на ${lang.value}`;
+          state.failures.push({ language: lang.value, type: '', page: '', model: '', description: '', error: err });
+          appendLog(err, 'err');
+          continue;
+        }
+
+        for (const type of selectedTypes) {
+          if (state.stopRequested) break;
+
+          appendLog(`Тип: ${type}`, 'info');
+          await ensureType(type);
+
+          let prevPageSig = null;
+          const firstSnap = await ensurePageReady(1, null, 'export');
+          if (!firstSnap) {
+            const err = `Не удалось открыть страницу 1 для ${lang.value}/${type}`;
+            state.failures.push({ language: lang.value, type, page: 1, model: '', description: '', error: err });
+            appendLog(err, 'err');
+            continue;
+          }
+
+          const firstRows = getRows().length || 20;
+          const totalItems = parseTotalItems();
+          const pInfo = getPaginationInfo();
+          let totalPages = pInfo.totalPages || null;
+          if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / firstRows);
+          if (!totalPages) totalPages = 1;
+
+          appendLog(`Страниц: ${totalPages}, total: ${totalItems ?? 'unknown'}`, 'info');
+
+          for (let page = 1; page <= totalPages; page++) {
+            if (state.stopRequested) break;
+
+            setStatus(`Export: ${lang.value} | ${type} | page ${page}/${totalPages}`);
+            appendLog(`Переход на страницу ${page}/${totalPages}`, 'info');
+
+            const snap = await ensurePageReady(page, prevPageSig, 'export');
+            if (!snap) {
+              const err = `Страница ${page}: не удалось получить свежие строки`;
+              state.failures.push({ language: lang.value, type, page, model: '', description: '', error: err });
+              appendLog(err, 'err');
+              continue;
+            }
+
+            prevPageSig = snap.rowsSig;
+
+            const rows = getRows();
+            appendLog(`На странице ${page} строк: ${rows.length}`, 'info');
+
+            const snapshot = rows.map((row, idx) => {
+              const rd = getRowData(row);
+              return {
+                language: lang.value,
+                type,
+                page,
+                rowIndex: idx + 1,
+                model: rd.model,
+                description: rd.description
+              };
+            });
+
+            for (let i = 0; i < snapshot.length; i++) {
+              if (state.stopRequested) break;
+
+              const item = snapshot[i];
+              const key = createResultKey(item.language, item.type, item.model, item.description);
+              if (uniqueOut.has(key)) continue;
+
+              setStatus(`Export: ${lang.value} | ${type} | page ${page}/${totalPages} | row ${i + 1}/${snapshot.length}`);
+              appendLog(`Row ${i + 1}/${snapshot.length}: ${item.model}`, 'info');
+
+              let liveRows = getRows();
+              let row = liveRows[item.rowIndex - 1] || null;
+
+              if (row) {
+                const rd = getRowData(row);
+                if (lower(rd.model) !== lower(item.model)) {
+                  row = findRowByIndexAndIdentity(item.rowIndex, item);
+                }
+              } else {
+                row = findRowByIndexAndIdentity(item.rowIndex, item);
+              }
+
+              let embed = '';
+              if (row) {
+                embed = await extractEmbedWithAttempts(row, item.model);
+              }
+
+              if (validEmbedValue(embed)) {
+                uniqueOut.add(key);
+                out.push({
+                  language: item.language,
+                  type: item.type,
+                  page: item.page,
+                  model: item.model,
+                  description: item.description,
+                  embed_iframe: embed
+                });
+                appendLog(`OK fast: ${item.model}`, 'ok');
+                continue;
+              }
+
+              appendLog(`Fast failed: ${item.model}`, 'warn');
+
+              const recovered = await extractEmbedWithRecovery(
+                {
+                  model: item.model,
+                  description: item.description,
+                  rowIndex: item.rowIndex
+                },
+                {
+                  language: item.language,
+                  type: item.type,
+                  page: item.page
+                },
+                prevPageSig
+              );
+
+              if (recovered.ok && validEmbedValue(recovered.embed)) {
+                uniqueOut.add(key);
+                out.push({
+                  language: item.language,
+                  type: item.type,
+                  page: item.page,
+                  model: item.model,
+                  description: item.description,
+                  embed_iframe: recovered.embed
+                });
+                appendLog(`OK recovery: ${item.model}`, 'ok');
+              } else {
+                const err = recovered.error || 'Не удалось получить ссылку Встроить';
+                state.failures.push({
+                  language: item.language,
+                  type: item.type,
+                  page: item.page,
+                  model: item.model,
+                  description: item.description,
+                  error: err
+                });
+                appendLog(`FAIL: ${item.model} | ${err}`, 'err');
+              }
+            }
+          }
+        }
+      }
+
+      if (state.stopRequested) {
+        setStatus(`Экспорт остановлен. Успешно: ${out.length}. Ошибок: ${state.failures.length}`);
+        appendLog(`Экспорт остановлен. Успешно: ${out.length}. Ошибок: ${state.failures.length}`, 'warn');
+      } else {
+        const stamp = fileStamp();
+        if (out.length) {
+          const csv = buildCsv(out);
+          downloadTextFile(`unowa_catalog_export_${stamp}.csv`, csv, 'text/csv;charset=utf-8');
+          appendLog(`CSV сохранён: ${out.length} строк`, 'ok');
+        }
+        if (state.failures.length) {
+          const failuresCsv = buildFailuresCsv(state.failures);
+          downloadTextFile(`unowa_catalog_export_failures_${stamp}.csv`, failuresCsv, 'text/csv;charset=utf-8');
+          appendLog(`CSV ошибок сохранён: ${state.failures.length} строк`, 'warn');
+        }
+        setStatus(`Экспорт завершён. Успешно: ${out.length}. Ошибок: ${state.failures.length}`);
+        appendLog(`Экспорт завершён. Успешно: ${out.length}. Ошибок: ${state.failures.length}`, 'ok');
+      }
+    } finally {
+      state.running = false;
+      state.stopRequested = false;
+      updateButtons();
+      renderLogs();
+    }
   }
 
   function boot() {
-    if (state.booted) return;
-    state.booted = true;
     createUI();
-    attachRouteWatcher();
-
-    if (is3DPlayerRoute()) setStatus('Готов. Введите запрос и нажмите Start');
-    else setStatus('Перейдите на страницу /3d-player');
+    setStatus('Готов. Введите запрос и нажмите Start');
+    appendLog('Boot complete', 'info');
   }
 
-  waitUntil(() => document.body, 15000, 60).then(() => boot());
+  waitUntil(() => document.body, 12000, 80).then(() => boot());
 })();

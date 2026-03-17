@@ -4,7 +4,7 @@
 // @version      2.7.0
 // @description  Search UNOWA models and export embed iframe catalog with live log panel
 // @author       ChatGPT
-// @match        https://*.unowa.eu/*
+// @match        https://student.unowa.eu/3d-player
 // @run-at       document-idle
 // @grant        none
 // @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO

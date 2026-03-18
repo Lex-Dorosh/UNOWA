@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         UNOWA Finder + Export Logger
 // @namespace    https://unowa.eu/
-// @version      2.7.0
-// @description  Search UNOWA models and export embed iframe catalog with live log panel
+// @version      2.8.1
+// @description  Search UNOWA models and export embed iframe catalog with stable sequential pagination
 // @author       ChatGPT
-// @match        https://student.unowa.eu/3d-player
+// @match        https://*.unowa.eu/*
 // @run-at       document-idle
 // @grant        none
 // @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO
@@ -16,8 +16,8 @@
 (function () {
   'use strict';
 
-  if (window.__UNOWA_FINDER_V270__) return;
-  window.__UNOWA_FINDER_V270__ = true;
+  if (window.__UNOWA_FINDER_V281__) return;
+  window.__UNOWA_FINDER_V281__ = true;
 
   const CFG = {
     ui: {
@@ -25,25 +25,23 @@
       zIndex: 2147483000
     },
     timings: {
-      pollMs: 90,
-      stableForMs: 220,
-      shortTimeoutMs: 1600,
-      clickSettleMs: 120,
-      typeSwitchMs: 220,
+      pollMs: 80,
+      stableForMs: 180,
+      shortMs: 120,
+      clickSettleMs: 130,
+      typeSwitchMs: 260,
       menuOpenMs: 260,
-      menuActionMs: 420,
-      flashMs: 4200,
-      searchPageReadyMs: 2600,
-      exportPageReadyMs: 5200,
-      exportRetryDelayMs: 420,
-      pageChangeTimeoutMs: 2600
+      menuActionMs: 360,
+      tableTimeoutMs: 3000,
+      pageMoveTimeoutMs: 3200
     },
     retries: {
-      langSwitch: 3,
+      pageMove: 4,
       pageReady: 3,
-      embedFast: 2,
+      embedSameRow: 3,
       embedRecovery: 3,
-      refindRow: 3
+      rowRefind: 3,
+      langSwitch: 3
     },
     storage: {
       minimized: 'unowaFinder.minimized',
@@ -74,7 +72,6 @@
   const qa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
   const norm = (s) => String(s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
   const lower = (s) => norm(s).toLowerCase();
-  const isCyr = (s) => /[А-Яа-яЁёІіЇїЄєҐґ]/.test(String(s || ''));
   const escHtml = (s) => String(s || '').replace(/[&<>"']/g, m => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[m]));
   const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -159,7 +156,8 @@
       kind
     });
 
-    if (state.logs.length > 1800) state.logs = state.logs.slice(-1400);
+    if (state.logs.length > 2500) state.logs = state.logs.slice(-2000);
+
     if (state.panelMode === 'logs') renderLogs();
   }
 
@@ -210,7 +208,7 @@
 #ufPanelTabs{display:flex;gap:6px}
 .uf-tab{border:1px solid #4e5662;background:#222831;color:#d9dfeb;border-radius:8px;padding:4px 8px;cursor:pointer}
 .uf-tab.active{background:#3658b8;border-color:#5e83ef;color:#fff}
-#ufPanelHost{border:1px solid #3a404a;border-radius:10px;background:#111418;overflow:auto;min-height:140px;max-height:50vh;padding:6px}
+#ufPanelHost{border:1px solid #3a404a;border-radius:10px;background:#111418;overflow:auto;min-height:140px;max-height:52vh;padding:6px}
 .uf-empty{opacity:.75;padding:8px}
 .uf-item{border:1px solid #313844;border-radius:10px;background:#171c22;padding:8px;margin-bottom:6px}
 .uf-item:last-child{margin-bottom:0}
@@ -232,7 +230,7 @@
 .uf-log.ok{color:#9de3a6}
 .uf-log.warn{color:#ffd27a}
 .uf-log.err{color:#ff9088}
-.uf-highlight-row{outline:3px solid #ff3b30 !important;outline-offset:-2px;background:rgba(255,59,48,.16) !important;box-shadow:inset 0 0 0 1px rgba(255,59,48,.35) !important;transition:background .2s ease}
+.uf-highlight-row{outline:3px solid #ff2d2d !important;outline-offset:-2px;background:rgba(255,45,45,.18) !important;box-shadow:inset 0 0 0 1px rgba(255,45,45,.40) !important}
 `;
     document.head.appendChild(st);
   }
@@ -242,13 +240,6 @@
     state.ui.startBtn.disabled = state.running;
     state.ui.exportBtn.disabled = state.running;
     state.ui.stopBtn.disabled = !state.running;
-  }
-
-  function selectedTypesFromUI() {
-    const out = [];
-    if (state.ui.scanStructure?.checked) out.push('structure');
-    if (state.ui.scanAnimation?.checked) out.push('animation');
-    return out;
   }
 
   function createResultKey(lang, type, model, desc) {
@@ -535,6 +526,7 @@
     ui.clearBtn.addEventListener('click', () => {
       state.results = [];
       state.logs = [];
+      clearHighlight();
       renderPanel();
       setStatus('Очищено');
     });
@@ -566,6 +558,13 @@
     return null;
   }
 
+  function getSelectedTypesFromUI() {
+    const out = [];
+    if (state.ui.scanStructure?.checked) out.push('structure');
+    if (state.ui.scanAnimation?.checked) out.push('animation');
+    return out;
+  }
+
   function getTable() {
     return qa('table').find(t => qa('tbody tr', t).length && qa('button[aria-haspopup="menu"]', t).length) || q('table.mantine-Table-table') || q('table');
   }
@@ -589,11 +588,14 @@
     return { row, tds, model, description, actionBtn };
   }
 
-  function getRowsSignature(limit = 10) {
-    return getRows().slice(0, limit).map(r => {
-      const d = getRowData(r);
-      return `${lower(d.model)}||${lower(d.description)}`;
-    }).join('###');
+  function rowContentSignature(row) {
+    const rd = getRowData(row);
+    return `${lower(rd.model)}||${lower(rd.description)}`;
+  }
+
+  function getRowsSignature() {
+    const rows = getRows();
+    return rows.map(rowContentSignature).join('###');
   }
 
   function getTotalTextNode() {
@@ -614,7 +616,7 @@
 
   function getPaginationInfo() {
     const root = getPaginationRoot();
-    if (!root) return { current: null, totalPages: null, buttons: [], root: null };
+    if (!root) return { current: null, totalPages: null, buttons: [] };
     const buttons = qa('button', root).filter(isVisible);
     const curBtn = q('button[aria-current="page"]', root);
     const current = curBtn ? Number(norm(curBtn.textContent)) || null : null;
@@ -629,12 +631,6 @@
     const btns = qa('button', root).filter(isVisible);
     if (btns.length < 2) return { prev: null, next: null };
     return { prev: btns[0], next: btns[btns.length - 1] };
-  }
-
-  function findPageButton(page) {
-    const root = getPaginationRoot();
-    if (!root) return null;
-    return qa('button', root).find(b => norm(b.textContent) === String(page));
   }
 
   function getTypeInputs() {
@@ -665,8 +661,8 @@
     const beforeSig = getRowsSignature();
     clickEl(target);
     await sleep(CFG.timings.typeSwitchMs);
-    await waitUntil(() => getCurrentType() === value, CFG.timings.shortTimeoutMs, 70);
-    await waitForFreshRows({ expectedPage: 1, prevRowsSig: beforeSig, timeoutMs: CFG.timings.searchPageReadyMs, allowSameRows: false });
+    await waitUntil(() => getCurrentType() === value, 1800, 70);
+    await waitForTableStable({ requireRows: true, timeoutMs: CFG.timings.tableTimeoutMs, previousRowsSig: beforeSig });
     if (getCurrentType() !== value) throw new Error(`Не удалось переключить тип на ${value}`);
     appendLog(`Тип переключен: ${value}`, 'ok');
     return true;
@@ -768,12 +764,13 @@
       const beforeSig = getRowsSignature();
       const ok = await openSelectAndChoose(wrapper, opts => opts.find(o => mapLangDisplayToCode(o.textContent) === lang) || null);
       if (!ok) {
-        await sleep(120 * attempt);
+        await sleep(130 * attempt);
         continue;
       }
 
       await waitUntil(() => getLanguageValue() === lang, 1800, 70);
-      await waitForFreshRows({ prevRowsSig: beforeSig, timeoutMs: CFG.timings.searchPageReadyMs, allowSameRows: false });
+      await waitForTableStable({ requireRows: true, timeoutMs: CFG.timings.tableTimeoutMs, previousRowsSig: beforeSig });
+
       if (getLanguageValue() === lang) {
         appendLog(`Язык переключен: ${lang}`, 'ok');
         return true;
@@ -783,6 +780,44 @@
     }
 
     return getLanguageValue() === lang;
+  }
+
+  async function getAvailableLanguages() {
+    const wrapper = getLanguageSelectWrapper();
+    const found = [];
+
+    if (!wrapper) {
+      const cur = getLanguageValue();
+      if (cur && ['en', 'ru'].includes(cur)) return [{ value: cur, label: cur }];
+      return [{ value: 'en', label: 'English' }, { value: 'ru', label: 'Русский' }];
+    }
+
+    const input = q('input.mantine-Select-input[readonly]', wrapper);
+    const originalDisplay = input ? norm(input.value) : '';
+    const originalCode = getLanguageValue();
+
+    clickEl(input);
+    await sleep(CFG.timings.clickSettleMs);
+
+    let opts = getOpenOptions();
+    if (!opts.length) opts = await waitUntil(() => getOpenOptions(), 1200, 60) || [];
+    for (const o of opts) {
+      const code = mapLangDisplayToCode(o.textContent);
+      const label = norm(o.textContent);
+      if (code && !found.some(x => x.value === code)) found.push({ value: code, label });
+    }
+
+    await closePopups();
+
+    if (!found.length && originalCode && ['en', 'ru'].includes(originalCode)) {
+      found.push({ value: originalCode, label: originalDisplay || originalCode });
+    }
+
+    if (!found.length) {
+      found.push({ value: 'en', label: 'English' }, { value: 'ru', label: 'Русский' });
+    }
+
+    return found.filter(x => ['en', 'ru'].includes(x.value));
   }
 
   function hasModelsTableUI() {
@@ -817,12 +852,11 @@
     };
   }
 
-  async function waitForFreshRows(opts = {}) {
-    const timeoutMs = opts.timeoutMs ?? CFG.timings.searchPageReadyMs;
+  async function waitForTableStable(opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? CFG.timings.tableTimeoutMs;
     const expectedPage = opts.expectedPage ?? null;
-    const prevRowsSig = opts.prevRowsSig ?? null;
-    const allowSameRows = !!opts.allowSameRows;
-    const requireRows = opts.requireRows !== false;
+    const requireRows = !!opts.requireRows;
+    const previousRowsSig = opts.previousRowsSig ?? null;
 
     let lastSig = '';
     let lastChange = Date.now();
@@ -832,24 +866,27 @@
     while (Date.now() - start < timeoutMs) {
       const snap = getTableSnapshot();
       lastSnap = snap;
-      const stableSig = JSON.stringify({
-        current: snap.current,
+
+      const sig = JSON.stringify({
         rows: snap.rows,
-        rowsSig: snap.rowsSig,
+        current: snap.current,
+        totalPages: snap.totalPages,
+        total: snap.total,
         type: snap.type,
-        lang: snap.lang
+        lang: snap.lang,
+        rowsSig: snap.rowsSig
       });
 
-      if (stableSig !== lastSig) {
-        lastSig = stableSig;
+      if (sig !== lastSig) {
+        lastSig = sig;
         lastChange = Date.now();
       }
 
       const pageOk = expectedPage == null || snap.current === expectedPage;
       const rowsOk = !requireRows || snap.rows > 0;
-      const freshOk = allowSameRows || !prevRowsSig || (snap.rowsSig && snap.rowsSig !== prevRowsSig);
+      const contentOk = !previousRowsSig || (snap.rowsSig && snap.rowsSig !== previousRowsSig) || (snap.current === expectedPage && snap.rows > 0);
 
-      if (pageOk && rowsOk && freshOk && (Date.now() - lastChange) >= CFG.timings.stableForMs) {
+      if (pageOk && rowsOk && contentOk && (Date.now() - lastChange) >= CFG.timings.stableForMs) {
         return snap;
       }
 
@@ -859,71 +896,112 @@
     return lastSnap;
   }
 
-  async function goToPageSimple(targetPage) {
-    targetPage = Number(targetPage);
-    if (!Number.isFinite(targetPage) || targetPage < 1) return false;
+  async function moveOnePage(direction, previousRowsSig = null) {
+    const dir = direction === 'prev' ? 'prev' : 'next';
 
-    let info = getPaginationInfo();
-    if (info.current === targetPage) return true;
+    for (let attempt = 1; attempt <= CFG.retries.pageMove; attempt++) {
+      if (state.stopRequested) return { ok: false, snap: getTableSnapshot() };
 
-    const maxSteps = 120;
+      const before = getTableSnapshot();
+      const btns = getPrevNextButtons();
+      const btn = dir === 'next' ? btns.next : btns.prev;
 
-    for (let i = 0; i < maxSteps; i++) {
-      info = getPaginationInfo();
-      if (info.current === targetPage) return true;
-
-      let btn = findPageButton(targetPage);
-      if (!btn) {
-        const { prev, next } = getPrevNextButtons();
-        btn = (info.current && info.current < targetPage) ? next : prev;
+      if (!btn || btn.disabled) {
+        return { ok: false, snap: before };
       }
 
-      if (!btn || btn.disabled) break;
-
-      const beforePage = info.current;
       clickEl(btn);
       await sleep(CFG.timings.clickSettleMs);
 
       await waitUntil(() => {
-        const now = getPaginationInfo().current;
-        return now && now !== beforePage;
-      }, CFG.timings.pageChangeTimeoutMs, 70);
+        const now = getTableSnapshot();
+        const pageChanged = now.current != null && before.current != null && now.current !== before.current;
+        const contentChanged = now.rowsSig && before.rowsSig && now.rowsSig !== before.rowsSig;
+        return pageChanged || contentChanged;
+      }, CFG.timings.pageMoveTimeoutMs, 60);
 
-      if (getPaginationInfo().current === targetPage) return true;
-    }
-
-    return getPaginationInfo().current === targetPage;
-  }
-
-  async function ensurePageReady(targetPage, prevRowsSig, mode = 'search') {
-    const timeoutMs = mode === 'export' ? CFG.timings.exportPageReadyMs : CFG.timings.searchPageReadyMs;
-
-    for (let attempt = 1; attempt <= CFG.retries.pageReady; attempt++) {
-      if (state.stopRequested) return null;
-
-      const ok = await goToPageSimple(targetPage);
-      if (!ok) {
-        await sleep(180 * attempt);
-        continue;
-      }
-
-      const snap = await waitForFreshRows({
-        expectedPage: targetPage,
-        prevRowsSig,
-        allowSameRows: targetPage === 1,
-        timeoutMs
+      const after = await waitForTableStable({
+        requireRows: true,
+        timeoutMs: CFG.timings.tableTimeoutMs,
+        previousRowsSig: previousRowsSig || before.rowsSig || null
       });
 
-      const freshOk = targetPage === 1 || !prevRowsSig || snap.rowsSig !== prevRowsSig;
-      if (snap.current === targetPage && snap.rows > 0 && freshOk) {
-        return snap;
+      const movedPage = before.current != null && after.current != null && after.current !== before.current;
+      const movedContent = before.rowsSig && after.rowsSig && after.rowsSig !== before.rowsSig;
+      const directionOk =
+        before.current == null || after.current == null
+          ? movedContent
+          : dir === 'next'
+            ? after.current > before.current || movedContent
+            : after.current < before.current || movedContent;
+
+      if (directionOk && (movedPage || movedContent)) {
+        return { ok: true, snap: after };
       }
 
-      appendLog(`Страница ${targetPage}: ещё старые строки, повтор ${attempt}/${CFG.retries.pageReady}`, 'warn');
-      await sleep(CFG.timings.exportRetryDelayMs * attempt);
+      appendLog(`Не подтвержден переход ${dir}, попытка ${attempt}/${CFG.retries.pageMove}`, 'warn');
+      await sleep(120 * attempt);
     }
 
-    return null;
+    return { ok: false, snap: getTableSnapshot() };
+  }
+
+  async function resetToFirstPage() {
+    const start = Date.now();
+    let guard = 0;
+
+    while (guard < 120) {
+      if (state.stopRequested) return false;
+
+      const p = getPaginationInfo();
+      if (!p.current || p.current === 1) {
+        await waitForTableStable({ expectedPage: 1, requireRows: true, timeoutMs: 1800 });
+        return true;
+      }
+
+      const beforeSig = getRowsSignature();
+      const moved = await moveOnePage('prev', beforeSig);
+      if (!moved.ok) break;
+
+      guard++;
+      if (Date.now() - start > 45000) break;
+    }
+
+    return (getPaginationInfo().current || 1) === 1;
+  }
+
+  async function goToPageSequential(targetPage) {
+    targetPage = Number(targetPage);
+    if (!Number.isFinite(targetPage) || targetPage < 1) return false;
+
+    const current = getPaginationInfo().current || 1;
+    if (current === targetPage) {
+      await waitForTableStable({ expectedPage: targetPage, requireRows: true, timeoutMs: 1800 });
+      return true;
+    }
+
+    const okFirst = await resetToFirstPage();
+    if (!okFirst) return false;
+
+    let now = getPaginationInfo().current || 1;
+    if (now !== 1) return false;
+
+    if (targetPage === 1) return true;
+
+    let lastSig = getRowsSignature();
+    while (now < targetPage) {
+      if (state.stopRequested) return false;
+
+      const moved = await moveOnePage('next', lastSig);
+      if (!moved.ok) return false;
+
+      now = moved.snap.current || (now + 1);
+      lastSig = moved.snap.rowsSig || getRowsSignature();
+
+      if (now > targetPage) return false;
+    }
+
+    return (getPaginationInfo().current || now) === targetPage;
   }
 
   function clearHighlight() {
@@ -933,16 +1011,12 @@
     state.lastHighlightedRow = null;
   }
 
-  function flashRow(row) {
-    clearHighlight();
+  function highlightRowPersistent(row) {
     if (!row) return;
+    clearHighlight();
     row.classList.add('uf-highlight-row');
     try { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {}
     state.lastHighlightedRow = row;
-    setTimeout(() => {
-      if (row.isConnected) row.classList.remove('uf-highlight-row');
-      if (state.lastHighlightedRow === row) state.lastHighlightedRow = null;
-    }, CFG.timings.flashMs);
   }
 
   function findRowForResult(result) {
@@ -963,6 +1037,16 @@
     return null;
   }
 
+  async function openResultHere(hit, result, openActions) {
+    highlightRowPersistent(hit.tr);
+    if (openActions) {
+      if (!hit.rd.actionBtn) throw new Error('Кнопка Actions не найдена');
+      await sleep(80);
+      clickEl(hit.rd.actionBtn);
+    }
+    setStatus(`Открыт результат: ${result.model} (стр. ${getPaginationInfo().current || result.page})`);
+  }
+
   async function navigateToResult(result, openActions = false) {
     if (state.running) throw new Error('Дождитесь окончания операции');
 
@@ -975,22 +1059,47 @@
 
     await ensureType(result.type);
 
-    const snap = await ensurePageReady(result.page, null, 'search');
-    if (!snap || snap.current !== result.page || snap.rows < 1) {
-      throw new Error(`Не удалось открыть страницу ${result.page}`);
+    const currentPageBefore = getPaginationInfo().current || 1;
+
+    clearHighlight();
+
+    if (currentPageBefore === result.page) {
+      await waitForTableStable({ expectedPage: result.page, requireRows: true, timeoutMs: 2000 });
+      const hitHere = findRowForResult(result);
+      if (hitHere) {
+        await openResultHere(hitHere, result, openActions);
+        return;
+      }
     }
 
-    const hit = findRowForResult(result);
-    if (!hit) throw new Error('Строка на странице не найдена');
+    const pagesToTry = [];
+    const seen = new Set();
+    [result.page, result.page - 1, result.page + 1, result.page - 2, result.page + 2].forEach(p => {
+      if (Number.isFinite(p) && p >= 1 && !seen.has(p)) {
+        seen.add(p);
+        pagesToTry.push(p);
+      }
+    });
 
-    flashRow(hit.tr);
-    setStatus(`Открыт результат: ${result.model}`);
+    for (const p of pagesToTry) {
+      const currentPage = getPaginationInfo().current || 1;
 
-    if (openActions) {
-      if (!hit.rd.actionBtn) throw new Error('Кнопка Actions не найдена');
-      await sleep(60);
-      clickEl(hit.rd.actionBtn);
+      if (currentPage !== p) {
+        const ok = await goToPageSequential(p);
+        if (!ok) continue;
+      }
+
+      await waitForTableStable({ expectedPage: p, requireRows: true, timeoutMs: 2200 });
+
+      const hit = findRowForResult(result);
+      if (hit) {
+        await openResultHere(hit, result, openActions);
+        if (p !== result.page) appendLog(`Результат найден на соседней странице: ожидалась ${result.page}, фактически ${p}`, 'warn');
+        return;
+      }
     }
+
+    throw new Error('Строка не найдена на целевой и соседних страницах');
   }
 
   function makeMatcher(query) {
@@ -1002,9 +1111,10 @@
     };
   }
 
-  function collectMatchesCurrentPage(matcher, scanLang, typeName, pageNum) {
+  function collectMatchesCurrentPage(matcher, scanLang, typeName, actualPage) {
     const rows = getRows();
     const out = [];
+    const pageNow = actualPage || getPaginationInfo().current || 1;
 
     rows.forEach((row, idx) => {
       const rd = getRowData(row);
@@ -1014,7 +1124,7 @@
       out.push({
         lang: scanLang || getLanguageValue() || '',
         type: typeName || getCurrentType() || 'unknown',
-        page: pageNum || getPaginationInfo().current || 1,
+        page: pageNow,
         rowIndex: idx + 1,
         model: rd.model,
         description: rd.description
@@ -1024,40 +1134,66 @@
     return out;
   }
 
-  async function scanType(typeName, matcher, langCode) {
+  async function scanTypeSequential(typeName, matcher, langCode) {
     await ensureType(typeName);
 
-    let prevSig = null;
-    const snap1 = await ensurePageReady(1, null, 'search');
-    if (!snap1) throw new Error(`Не удалось открыть страницу 1 для ${typeName}`);
+    const okFirst = await resetToFirstPage();
+    if (!okFirst) throw new Error(`Не удалось перейти на страницу 1 для ${typeName}`);
 
-    const firstRows = getRows().length || 20;
+    let snap = await waitForTableStable({ expectedPage: 1, requireRows: true, timeoutMs: CFG.timings.tableTimeoutMs });
+    let currentPage = snap.current || 1;
+    let currentSig = snap.rowsSig || getRowsSignature();
+
+    const rowsOnFirst = getRows().length || 20;
     const totalItems = parseTotalItems();
     const pInfo = getPaginationInfo();
     let totalPages = pInfo.totalPages || null;
-    if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / firstRows);
+    if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / rowsOnFirst);
     if (!totalPages) totalPages = 1;
 
     appendLog(`Сканирование ${typeName}, язык ${langCode}, страниц: ${totalPages}`, 'info');
 
-    for (let page = 1; page <= totalPages; page++) {
+    const visitedPageSignatures = new Set();
+
+    while (true) {
       if (state.stopRequested) return;
 
-      setStatus(`Поиск: ${typeName} | страница ${page}/${totalPages}...`);
+      const pageNumber = getPaginationInfo().current || currentPage || 1;
+      const stable = await waitForTableStable({ expectedPage: pageNumber, requireRows: true, timeoutMs: 1800 });
+      currentPage = stable.current || pageNumber;
+      currentSig = stable.rowsSig || getRowsSignature();
 
-      const snap = await ensurePageReady(page, prevSig, 'search');
-      if (!snap) {
-        appendLog(`Страница ${page}: не удалось получить свежие строки (${typeName})`, 'warn');
-        continue;
+      const visitKey = `${typeName}::${langCode}::${currentPage}::${currentSig}`;
+      if (!visitedPageSignatures.has(visitKey)) {
+        visitedPageSignatures.add(visitKey);
+
+        const found = collectMatchesCurrentPage(matcher, langCode, typeName, currentPage);
+        found.forEach(addResult);
+
+        if (found.length) appendLog(`Страница ${currentPage}: найдено ${found.length}`, 'ok');
+        else appendLog(`Страница ${currentPage}: совпадений нет`, 'info');
+
+        renderResults();
+      } else {
+        appendLog(`Страница ${currentPage}: пропуск повторного снимка`, 'warn');
       }
 
-      const found = collectMatchesCurrentPage(matcher, langCode, typeName, page);
-      for (const f of found) addResult(f);
+      const { next } = getPrevNextButtons();
+      const endByDisabled = !next || next.disabled;
+      const endByCount = totalPages && currentPage >= totalPages;
 
-      prevSig = snap.rowsSig;
+      if (endByDisabled || endByCount) break;
 
-      if (found.length) appendLog(`Страница ${page}: найдено ${found.length}`, 'ok');
-      renderResults();
+      setStatus(`Поиск: ${typeName} | страница ${currentPage + 1}/${totalPages || '?' }...`);
+      const moved = await moveOnePage('next', currentSig);
+
+      if (!moved.ok) {
+        appendLog(`Не удалось перейти на следующую страницу после ${currentPage} (${typeName})`, 'warn');
+        break;
+      }
+
+      currentPage = moved.snap.current || (currentPage + 1);
+      currentSig = moved.snap.rowsSig || getRowsSignature();
     }
   }
 
@@ -1123,7 +1259,7 @@
     return String(captured || '').trim();
   }
 
-  async function extractEmbedFromRow(row) {
+  async function extractEmbedFromRowOnce(row) {
     const rd = getRowData(row);
     if (!rd.actionBtn) return '';
 
@@ -1150,6 +1286,15 @@
     return valid;
   }
 
+  async function extractEmbedFromRow(row, attempts = 1) {
+    for (let i = 1; i <= attempts; i++) {
+      const embed = await extractEmbedFromRowOnce(row);
+      if (validEmbedValue(embed)) return embed;
+      if (i < attempts) await sleep(150 * i);
+    }
+    return '';
+  }
+
   function findRowByIdentity(identity) {
     const rows = getRows();
     const targetModel = lower(identity.model);
@@ -1165,80 +1310,12 @@
       if (lower(rd.model) === targetModel) return row;
     }
 
+    if (identity.rowIndex && rows[identity.rowIndex - 1]) {
+      const rd = getRowData(rows[identity.rowIndex - 1]);
+      if (lower(rd.model) === targetModel) return rows[identity.rowIndex - 1];
+    }
+
     return null;
-  }
-
-  function findRowByIndexAndIdentity(rowIndex, identity) {
-    const rows = getRows();
-    const idx = Math.max(0, rowIndex - 1);
-
-    if (rows[idx]) {
-      const rd = getRowData(rows[idx]);
-      if (lower(rd.model) === lower(identity.model)) return rows[idx];
-    }
-
-    return findRowByIdentity(identity);
-  }
-
-  async function extractEmbedWithAttempts(row, label) {
-    for (let attempt = 1; attempt <= CFG.retries.embedFast; attempt++) {
-      const embed = await extractEmbedFromRow(row);
-      if (validEmbedValue(embed)) return embed;
-      if (attempt < CFG.retries.embedFast) {
-        appendLog(`Fast retry ${attempt}/${CFG.retries.embedFast - 1}: ${label}`, 'warn');
-        await sleep(CFG.timings.exportRetryDelayMs);
-      }
-    }
-    return '';
-  }
-
-  async function restoreExportContext(ctx, prevPageSig) {
-    const okLang = await ensureLanguage(ctx.language);
-    if (!okLang) return null;
-
-    await ensureType(ctx.type);
-    return await ensurePageReady(ctx.page, prevPageSig, 'export');
-  }
-
-  async function extractEmbedWithRecovery(identity, ctx, prevPageSig) {
-    let lastError = '';
-
-    for (let attempt = 1; attempt <= CFG.retries.embedRecovery; attempt++) {
-      if (state.stopRequested) return { ok: false, embed: '', error: 'stopped' };
-
-      appendLog(`Recovery ${attempt}/${CFG.retries.embedRecovery}: ${identity.model} | ${ctx.language} | ${ctx.type} | page ${ctx.page}`, 'warn');
-
-      const snap = await restoreExportContext(ctx, prevPageSig);
-      if (!snap) {
-        lastError = `Не удалось восстановить контекст page ${ctx.page}`;
-        await sleep(CFG.timings.exportRetryDelayMs * attempt);
-        continue;
-      }
-
-      let row = null;
-      for (let refind = 1; refind <= CFG.retries.refindRow; refind++) {
-        row = findRowByIndexAndIdentity(identity.rowIndex, identity);
-        if (row) break;
-        await sleep(120 * refind);
-      }
-
-      if (!row) {
-        lastError = 'Строка не найдена после возврата на страницу';
-        await sleep(CFG.timings.exportRetryDelayMs * attempt);
-        continue;
-      }
-
-      const embed = await extractEmbedWithAttempts(row, identity.model);
-      if (validEmbedValue(embed)) {
-        appendLog(`Recovery success: ${identity.model}`, 'ok');
-        return { ok: true, embed, error: '' };
-      }
-
-      lastError = 'Пустой iframe после recovery';
-      await sleep(CFG.timings.exportRetryDelayMs * attempt);
-    }
-
-    return { ok: false, embed: '', error: lastError || 'Не удалось получить iframe' };
   }
 
   function csvEscape(v) {
@@ -1304,13 +1381,10 @@
       return;
     }
 
-    const types = selectedTypesFromUI();
-    let lang = state.ui.language.value || 'keep';
+    const selectedTypes = getSelectedTypesFromUI();
+    const lang = state.ui.language.value || 'keep';
 
-    if (lang === 'keep') lang = isCyr(query) ? 'ru' : 'en';
-    if (!['en', 'ru'].includes(lang)) lang = isCyr(query) ? 'ru' : 'en';
-
-    if (!types.length) {
+    if (!selectedTypes.length) {
       setStatus('Выберите хотя бы один тип');
       return;
     }
@@ -1321,6 +1395,7 @@
     state.running = true;
     state.stopRequested = false;
     state.results = [];
+    clearHighlight();
     updateButtons();
     setPanelMode('results');
     renderResults();
@@ -1328,17 +1403,23 @@
     try {
       await waitFor3DModelsPage();
       setStatus('Подготовка страницы...');
-      appendLog(`Start search: "${query}" | lang=${lang} | types=${types.join(',')}`, 'info');
+      appendLog(`Start search: "${query}" | lang=${lang} | types=${selectedTypes.join(',')}`, 'info');
 
-      const okLang = await ensureLanguage(lang);
-      if (!okLang) {
-        appendLog(`Не удалось переключить язык на ${lang}, продолжаю как есть`, 'warn');
+      if (lang !== 'keep') {
+        const okLang = await ensureLanguage(lang);
+        if (!okLang) {
+          appendLog(`Не удалось переключить язык на ${lang}, продолжаю как есть`, 'warn');
+          setStatus(`Не удалось переключить язык на ${lang}, продолжаю как есть`);
+        }
       }
 
+      await waitForTableStable({ requireRows: true, timeoutMs: 1800 });
+
       const matcher = makeMatcher(query);
-      for (const type of types) {
+
+      for (const type of selectedTypes) {
         if (state.stopRequested) break;
-        await scanType(type, matcher, lang);
+        await scanTypeSequential(type, matcher, lang === 'keep' ? (getLanguageValue() || '') : lang);
       }
 
       setStatus(state.stopRequested ? `Остановлено. Найдено: ${state.results.length}` : `Готово. Найдено: ${state.results.length}`);
@@ -1354,6 +1435,12 @@
   async function exportCatalog() {
     if (state.running) return;
 
+    const selectedTypes = getSelectedTypesFromUI();
+    if (!selectedTypes.length) {
+      setStatus('Для экспорта выберите хотя бы один тип');
+      return;
+    }
+
     state.running = true;
     state.stopRequested = false;
     state.failures = [];
@@ -1367,48 +1454,10 @@
       appendLog('Экспорт запущен', 'info');
 
       const exportAllLangs = !!state.ui.exportAllLangs.checked;
-      const selectedTypes = selectedTypesFromUI();
-
-      if (!selectedTypes.length) {
-        throw new Error('Для экспорта не выбран ни один тип');
-      }
-
       let languages = [];
+
       if (exportAllLangs) {
-        const available = [];
-        const wrapper = getLanguageSelectWrapper();
-
-        if (wrapper) {
-          const input = q('input.mantine-Select-input[readonly]', wrapper);
-          const originalCode = getLanguageValue();
-          const originalDisplay = input ? norm(input.value) : '';
-
-          clickEl(input);
-          await sleep(CFG.timings.clickSettleMs);
-
-          let opts = getOpenOptions();
-          if (!opts.length) opts = await waitUntil(() => getOpenOptions(), 1200, 60) || [];
-
-          for (const o of opts) {
-            const code = mapLangDisplayToCode(o.textContent);
-            const label = norm(o.textContent);
-            if (code && !available.some(x => x.value === code)) {
-              available.push({ value: code, label });
-            }
-          }
-
-          await closePopups();
-
-          if (!available.length && originalCode && ['en', 'ru'].includes(originalCode)) {
-            available.push({ value: originalCode, label: originalDisplay || originalCode });
-          }
-        }
-
-        if (!available.length) {
-          available.push({ value: 'en', label: 'English' }, { value: 'ru', label: 'Русский' });
-        }
-
-        languages = available.filter(x => ['en', 'ru'].includes(x.value));
+        languages = await getAvailableLanguages();
       } else {
         const selected = state.ui.language.value || 'keep';
         if (selected === 'keep') {
@@ -1429,6 +1478,7 @@
         if (state.stopRequested) break;
 
         appendLog(`--- Язык: ${lang.value} ---`, 'info');
+
         const okLang = await ensureLanguage(lang.value);
         if (!okLang) {
           const err = `Не удалось переключить язык на ${lang.value}`;
@@ -1437,142 +1487,158 @@
           continue;
         }
 
+        await waitForTableStable({ requireRows: true, timeoutMs: 1800 });
+
         for (const type of selectedTypes) {
           if (state.stopRequested) break;
 
           appendLog(`Тип: ${type}`, 'info');
           await ensureType(type);
 
-          let prevPageSig = null;
-          const firstSnap = await ensurePageReady(1, null, 'export');
-          if (!firstSnap) {
-            const err = `Не удалось открыть страницу 1 для ${lang.value}/${type}`;
+          const okFirst = await resetToFirstPage();
+          if (!okFirst) {
+            const err = `Не удалось перейти на страницу 1 для ${lang.value}/${type}`;
             state.failures.push({ language: lang.value, type, page: 1, model: '', description: '', error: err });
             appendLog(err, 'err');
             continue;
           }
 
-          const firstRows = getRows().length || 20;
+          let snap = await waitForTableStable({ expectedPage: 1, requireRows: true, timeoutMs: CFG.timings.tableTimeoutMs });
+          let currentPage = snap.current || 1;
+          let currentSig = snap.rowsSig || getRowsSignature();
+
+          const rowsOnFirst = getRows().length || 20;
           const totalItems = parseTotalItems();
           const pInfo = getPaginationInfo();
           let totalPages = pInfo.totalPages || null;
-          if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / firstRows);
+          if (!totalPages && totalItems) totalPages = Math.ceil(totalItems / rowsOnFirst);
           if (!totalPages) totalPages = 1;
 
           appendLog(`Страниц: ${totalPages}, total: ${totalItems ?? 'unknown'}`, 'info');
 
-          for (let page = 1; page <= totalPages; page++) {
+          const visitedSnapshots = new Set();
+
+          while (true) {
             if (state.stopRequested) break;
 
-            setStatus(`Export: ${lang.value} | ${type} | page ${page}/${totalPages}`);
-            appendLog(`Переход на страницу ${page}/${totalPages}`, 'info');
+            const stable = await waitForTableStable({ expectedPage: currentPage, requireRows: true, timeoutMs: 2000 });
+            currentPage = stable.current || currentPage;
+            currentSig = stable.rowsSig || currentSig || getRowsSignature();
 
-            const snap = await ensurePageReady(page, prevPageSig, 'export');
-            if (!snap) {
-              const err = `Страница ${page}: не удалось получить свежие строки`;
-              state.failures.push({ language: lang.value, type, page, model: '', description: '', error: err });
-              appendLog(err, 'err');
-              continue;
-            }
+            const snapshotKey = `${lang.value}::${type}::${currentPage}::${currentSig}`;
+            if (!visitedSnapshots.has(snapshotKey)) {
+              visitedSnapshots.add(snapshotKey);
 
-            prevPageSig = snap.rowsSig;
+              setStatus(`Export: ${lang.value} | ${type} | page ${currentPage}/${totalPages}`);
+              appendLog(`На странице ${currentPage} строк: ${getRows().length}`, 'info');
 
-            const rows = getRows();
-            appendLog(`На странице ${page} строк: ${rows.length}`, 'info');
-
-            const snapshot = rows.map((row, idx) => {
-              const rd = getRowData(row);
-              return {
-                language: lang.value,
-                type,
-                page,
-                rowIndex: idx + 1,
-                model: rd.model,
-                description: rd.description
-              };
-            });
-
-            for (let i = 0; i < snapshot.length; i++) {
-              if (state.stopRequested) break;
-
-              const item = snapshot[i];
-              const key = createResultKey(item.language, item.type, item.model, item.description);
-              if (uniqueOut.has(key)) continue;
-
-              setStatus(`Export: ${lang.value} | ${type} | page ${page}/${totalPages} | row ${i + 1}/${snapshot.length}`);
-              appendLog(`Row ${i + 1}/${snapshot.length}: ${item.model}`, 'info');
-
-              let liveRows = getRows();
-              let row = liveRows[item.rowIndex - 1] || null;
-
-              if (row) {
+              const snapshotRows = getRows().map((row, idx) => {
                 const rd = getRowData(row);
-                if (lower(rd.model) !== lower(item.model)) {
-                  row = findRowByIndexAndIdentity(item.rowIndex, item);
+                return {
+                  language: lang.value,
+                  type,
+                  page: currentPage,
+                  rowIndex: idx + 1,
+                  model: rd.model,
+                  description: rd.description
+                };
+              });
+
+              for (let i = 0; i < snapshotRows.length; i++) {
+                if (state.stopRequested) break;
+
+                const item = snapshotRows[i];
+                const key = createResultKey(item.language, item.type, item.model, item.description);
+
+                if (uniqueOut.has(key)) {
+                  appendLog(`Skip duplicate safety: ${item.model}`, 'warn');
+                  continue;
                 }
-              } else {
-                row = findRowByIndexAndIdentity(item.rowIndex, item);
+
+                setStatus(`Export: ${lang.value} | ${type} | page ${currentPage}/${totalPages} | row ${i + 1}/${snapshotRows.length}`);
+                appendLog(`Row ${i + 1}/${snapshotRows.length}: ${item.model}`, 'info');
+
+                let row = findRowByIdentity(item);
+                let embed = '';
+
+                if (row) {
+                  embed = await extractEmbedFromRow(row, CFG.retries.embedSameRow);
+                }
+
+                if (!validEmbedValue(embed)) {
+                  appendLog(`Fast failed: ${item.model}`, 'warn');
+
+                  for (let retry = 1; retry <= CFG.retries.embedRecovery; retry++) {
+                    if (state.stopRequested) break;
+
+                    appendLog(`Recovery ${retry}/${CFG.retries.embedRecovery}: ${item.model} | ${lang.value} | ${type} | page ${currentPage}`, 'warn');
+
+                    await goToPageSequential(currentPage);
+                    await waitForTableStable({ expectedPage: currentPage, requireRows: true, timeoutMs: 2200 });
+
+                    let refound = null;
+                    for (let rr = 1; rr <= CFG.retries.rowRefind; rr++) {
+                      refound = findRowByIdentity(item);
+                      if (refound) break;
+                      await sleep(120 * rr);
+                    }
+
+                    if (!refound) {
+                      continue;
+                    }
+
+                    embed = await extractEmbedFromRow(refound, 2);
+                    if (validEmbedValue(embed)) break;
+                    await sleep(180 * retry);
+                  }
+                }
+
+                if (validEmbedValue(embed)) {
+                  uniqueOut.add(key);
+                  out.push({
+                    language: item.language,
+                    type: item.type,
+                    page: item.page,
+                    model: item.model,
+                    description: item.description,
+                    embed_iframe: embed
+                  });
+                  appendLog(`OK: ${item.model}`, 'ok');
+                } else {
+                  const err = 'Не удалось получить ссылку "Встроить"';
+                  state.failures.push({
+                    language: item.language,
+                    type: item.type,
+                    page: item.page,
+                    model: item.model,
+                    description: item.description,
+                    error: err
+                  });
+                  appendLog(`FAIL: ${item.model} | ${err}`, 'err');
+                }
               }
-
-              let embed = '';
-              if (row) {
-                embed = await extractEmbedWithAttempts(row, item.model);
-              }
-
-              if (validEmbedValue(embed)) {
-                uniqueOut.add(key);
-                out.push({
-                  language: item.language,
-                  type: item.type,
-                  page: item.page,
-                  model: item.model,
-                  description: item.description,
-                  embed_iframe: embed
-                });
-                appendLog(`OK fast: ${item.model}`, 'ok');
-                continue;
-              }
-
-              appendLog(`Fast failed: ${item.model}`, 'warn');
-
-              const recovered = await extractEmbedWithRecovery(
-                {
-                  model: item.model,
-                  description: item.description,
-                  rowIndex: item.rowIndex
-                },
-                {
-                  language: item.language,
-                  type: item.type,
-                  page: item.page
-                },
-                prevPageSig
-              );
-
-              if (recovered.ok && validEmbedValue(recovered.embed)) {
-                uniqueOut.add(key);
-                out.push({
-                  language: item.language,
-                  type: item.type,
-                  page: item.page,
-                  model: item.model,
-                  description: item.description,
-                  embed_iframe: recovered.embed
-                });
-                appendLog(`OK recovery: ${item.model}`, 'ok');
-              } else {
-                const err = recovered.error || 'Не удалось получить ссылку Встроить';
-                state.failures.push({
-                  language: item.language,
-                  type: item.type,
-                  page: item.page,
-                  model: item.model,
-                  description: item.description,
-                  error: err
-                });
-                appendLog(`FAIL: ${item.model} | ${err}`, 'err');
-              }
+            } else {
+              appendLog(`Пропуск повторного снимка страницы ${currentPage}`, 'warn');
             }
+
+            const { next } = getPrevNextButtons();
+            const endByDisabled = !next || next.disabled;
+            const endByCount = totalPages && currentPage >= totalPages;
+
+            if (endByDisabled || endByCount) break;
+
+            appendLog(`Переход на страницу ${currentPage + 1}/${totalPages}`, 'info');
+            const moved = await moveOnePage('next', currentSig);
+
+            if (!moved.ok) {
+              const err = `Не удалось перейти на следующую страницу после ${currentPage}`;
+              state.failures.push({ language: lang.value, type, page: currentPage, model: '', description: '', error: err });
+              appendLog(err, 'err');
+              break;
+            }
+
+            currentPage = moved.snap.current || (currentPage + 1);
+            currentSig = moved.snap.rowsSig || currentSig || getRowsSignature();
           }
         }
       }
@@ -1583,13 +1649,11 @@
       } else {
         const stamp = fileStamp();
         if (out.length) {
-          const csv = buildCsv(out);
-          downloadTextFile(`unowa_catalog_export_${stamp}.csv`, csv, 'text/csv;charset=utf-8');
+          downloadTextFile(`unowa_catalog_export_${stamp}.csv`, buildCsv(out), 'text/csv;charset=utf-8');
           appendLog(`CSV сохранён: ${out.length} строк`, 'ok');
         }
         if (state.failures.length) {
-          const failuresCsv = buildFailuresCsv(state.failures);
-          downloadTextFile(`unowa_catalog_export_failures_${stamp}.csv`, failuresCsv, 'text/csv;charset=utf-8');
+          downloadTextFile(`unowa_catalog_export_failures_${stamp}.csv`, buildFailuresCsv(state.failures), 'text/csv;charset=utf-8');
           appendLog(`CSV ошибок сохранён: ${state.failures.length} строк`, 'warn');
         }
         setStatus(`Экспорт завершён. Успешно: ${out.length}. Ошибок: ${state.failures.length}`);
